@@ -1,0 +1,16 @@
+# Customer B: EU manufacturer. Zero price tolerance, lower auto-approve limit,
+# stricter confidence threshold, and an AP system that uses a different status label.
+name: Borealis Manufacturing
+tenant_slug: borealis
+allowed_currencies: [EUR, USD]
+price_tolerance_pct: "0"
+total_tolerance_abs: "0.01"
+quantity_tolerance: "0"
+auto_approve_limit: "5000"
+confidence_threshold: 0.90
+vendor_match_min: 0.90
+max_invoice_age_days: 180
+# Every scanned invoice goes to a person.
+allow_auto_approve_scanned: false
+ap:
+  approved_status: APPROVED_FOR_PAYMENT

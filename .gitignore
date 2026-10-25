@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+.storage/
+.env
+data/generated/
+eval/results/*
+!eval/results/.gitkeep
+ui/node_modules/
+ui/dist/
+.pytest_cache/
+.ruff_cache/
+.venv/

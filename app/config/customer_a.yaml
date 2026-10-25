@@ -1,0 +1,15 @@
+# Customer A: US distributor. Tolerant on small price changes, higher auto-approve limit.
+name: Acme Distribution
+tenant_slug: acme
+allowed_currencies: [USD]
+price_tolerance_pct: "2.0"
+total_tolerance_abs: "0.05"
+quantity_tolerance: "0"
+auto_approve_limit: "10000"
+confidence_threshold: 0.80
+vendor_match_min: 0.85
+max_invoice_age_days: 365
+# OCR'd invoices may auto-approve if every check passes and calibrated confidence clears the threshold.
+allow_auto_approve_scanned: true
+ap:
+  approved_status: approved

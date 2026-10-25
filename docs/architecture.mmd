@@ -1,0 +1,77 @@
+flowchart TD
+    subgraph Online["Online pipeline"]
+        UI["React dashboard: upload, review queue, metrics"] --> API["FastAPI: auth + tenant check"]
+        API --> JOBS["Postgres job table: SKIP LOCKED, leases, retries, stale-job recovery"]
+        JOBS --> W["LangGraph worker (Postgres checkpointer)"]
+
+        W --> ING["Ingest: file type check, hash for duplicates, store in S3"]
+        ING --> PARSE{"Digital PDF?"}
+        PARSE -->|Yes| DOC["Docling layout parse"]
+        PARSE -->|No| OCR["OCR (PaddleOCR / Textract) + region confidence"]
+        DOC --> EXT["LLM extraction: schema fields only, no tools, document text treated as untrusted"]
+        OCR --> EXT
+        EXT --> VAL["Deterministic checks: totals = sum of lines, tax, dates, currency"]
+        VAL --> RET["Retrieve authorized PO + receipt (row-level security, pgvector vendor match)"]
+        RET --> REC["Three-way match: Python rules with tolerances"]
+        REC --> CONF["Calibrated confidence: extraction agreement + check results + OCR score + vendor match"]
+
+        CONF --> G1{"Gate 1: any hard rule failure?"}
+        G1 -->|Yes| REJ["Reject with reason"]
+        G1 -->|No| G2{"Gate 2: amount above limit?"}
+        G2 -->|Yes| PAUSE
+        G2 -->|No| G3{"Gate 3: confidence below threshold?"}
+        G3 -->|Yes| PAUSE["Checkpoint state, release worker"]
+        G3 -->|No| TXN
+
+        PAUSE --> HITL["Reviewer sees evidence + reason"]
+        HITL -->|Decision| RESUME["New job resumes from checkpoint"]
+        RESUME -->|Reject| REJ
+        RESUME -->|Correct fields| CORR["Store correction (separate table)"]
+        CORR --> VAL
+        RESUME -->|Approve| REVAL["Revalidate: reviewer permissions, invoice version, PO still open, current policy, rerun checks + match"]
+        REVAL -->|Still valid| TXN["One DB transaction: approval + outbox event with idempotency key"]
+        REVAL -->|Changed| PAUSE
+
+        TXN --> DISP["Outbox dispatcher"]
+        DISP --> MOCK["Mock AP API: set invoice status to approved (honors idempotency key)"]
+        MOCK -->|Success| VER["Read back final state, check for duplicates"]
+        MOCK -->|Timeout| CHECK["Query whether action already applied"]
+        CHECK -->|Applied| VER
+        CHECK -->|Not applied| RETRY["Retry with backoff, dead-letter after N"]
+        RETRY --> DISP
+        RETRY -->|N reached| ALERT
+        VER -->|Matches| AUD["Audit record + status update"]
+        VER -->|Mismatch| ALERT["Record auditable failure, escalate to human"]
+        REJ --> AUD
+    end
+
+    subgraph Data["Storage"]
+        PG["Postgres + pgvector: documents, POs, receipts, jobs, checkpoints, outbox, audit, corrections"]
+        S3["S3 / MinIO: files + evidence snapshots"]
+    end
+
+    subgraph Observe["Observability"]
+        RED["Redact bank details + tax IDs"] --> OTEL["OpenTelemetry traces to Langfuse: prompt, output, cost, latency per step"]
+    end
+
+    subgraph Eval["Offline evaluation (runs in CI)"]
+        TEST["Frozen test set: DocILE + CORD + generated POs + ~200 seeded errors incl. prompt injection. Never modified after day 9"]
+        DEV["Dev / calibration set: hand-selected reviewer corrections + separate synthetic docs"]
+        HARN["Eval harness: replays pipeline with actions mocked"]
+        BASE["Baselines: LLM-only extraction, rules-only matcher"]
+        MET["Metrics: field F1, mismatch recall/precision, wrong auto-approvals, review rate, cost, p95"]
+        CALFIT["Fit confidence calibration on dev set (isotonic / logistic)"]
+        CAL["Threshold sweep: review rate vs wrong auto-approvals curve"]
+        DEV --> CALFIT --> CAL
+        TEST --> HARN
+        BASE --> MET
+        HARN --> MET
+        CAL --> HARN
+    end
+
+    W <--> PG
+    W <--> S3
+    W -.-> RED
+    CALFIT -.->|calibration model| CONF
+    CAL -.->|threshold| G3
+    CORR -.->|manual selection only| DEV
