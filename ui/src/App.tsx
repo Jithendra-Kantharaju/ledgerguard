@@ -6,11 +6,13 @@ import {
   useState,
 } from "react";
 
-import {
-  Api,
+import { Api } from "./api";
+
+import type {
   DocDetail,
   DocSummary,
   ReviewRequest,
+  UserInfo,
 } from "./api";
 
 const STATUSES = [
@@ -36,43 +38,39 @@ const FIELDS = [
   "total",
 ];
 
-type ReviewAction = "approve" | "correct" | "reject";
-
-type UserInfo = {
-  email: string;
-  role: string;
-  approval_limit: string;
-};
+type ReviewAction =
+  | "approve"
+  | "correct"
+  | "reject";
 
 function loadKey(): string {
   try {
-    return localStorage.getItem(
-      "ap-api-key"
-    ) ?? "";
+    return localStorage.getItem("ap-api-key") ?? "";
   } catch {
     return "";
   }
 }
 
-function saveKey(key: string) {
+function saveKey(key: string): void {
   try {
-    localStorage.setItem(
-      "ap-api-key",
-      key
-    );
+    localStorage.setItem("ap-api-key", key);
   } catch {
     // Browser storage unavailable.
   }
 }
 
+// --------------------
+// Main application
+// --------------------
+
 export default function App() {
-  const [key, setKey] = useState(loadKey());
+  const [key, setKey] = useState<string>(loadKey);
 
   const [user, setUser] =
     useState<UserInfo | null>(null);
 
   const [status, setStatus] =
-    useState("awaiting_review");
+    useState<string>("awaiting_review");
 
   const [docs, setDocs] =
     useState<DocSummary[]>([]);
@@ -88,7 +86,7 @@ export default function App() {
     [key]
   );
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (): Promise<void> => {
     if (!key) {
       setUser(null);
       setDocs([]);
@@ -96,28 +94,43 @@ export default function App() {
     }
 
     try {
-      const currentUser = await api.me();
-      const documents = await api.list(status);
+      const [currentUser, documents] =
+        await Promise.all([
+          api.me(),
+          api.list(status),
+        ]);
 
       setUser(currentUser);
       setDocs(documents);
       setError(null);
-
     } catch (err) {
       setError(String(err));
     }
   }, [api, key, status]);
 
   useEffect(() => {
-    refresh();
+    void refresh();
 
-    const timer = setInterval(
-      refresh,
-      5000
-    );
+    const timer = window.setInterval(() => {
+      void refresh();
+    }, 5000);
 
-    return () => clearInterval(timer);
+    return () => {
+      window.clearInterval(timer);
+    };
   }, [refresh]);
+
+  async function handleUpload(
+    file: File
+  ): Promise<void> {
+    try {
+      await api.upload(file);
+      await refresh();
+      setError(null);
+    } catch (err) {
+      setError(String(err));
+    }
+  }
 
   return (
     <div className="app">
@@ -130,6 +143,7 @@ export default function App() {
           value={key}
           onChange={(event) => {
             const value = event.target.value;
+
             setKey(value);
             saveKey(value);
           }}
@@ -137,11 +151,8 @@ export default function App() {
 
         {user && (
           <span className="who">
-            {user.email}
-            {" · "}
-            {user.role}
-            {" · "}
-            limit {user.approval_limit}
+            {user.email} · {user.role} · limit{" "}
+            {user.approval_limit}
           </span>
         )}
 
@@ -151,19 +162,12 @@ export default function App() {
           <input
             type="file"
             accept="application/pdf"
-            onChange={async (event) => {
-              const file =
-                event.target.files?.[0];
+            onChange={(event) => {
+              const file = event.target.files?.[0];
 
               if (!file) return;
 
-              try {
-                await api.upload(file);
-                await refresh();
-
-              } catch (err) {
-                setError(String(err));
-              }
+              void handleUpload(file);
 
               event.target.value = "";
             }}
@@ -181,15 +185,12 @@ export default function App() {
         <aside>
           <select
             value={status}
-            onChange={(event) =>
-              setStatus(event.target.value)
-            }
+            onChange={(event) => {
+              setStatus(event.target.value);
+            }}
           >
             {STATUSES.map((item) => (
-              <option
-                key={item}
-                value={item}
-              >
+              <option key={item} value={item}>
                 {item || "all"}
               </option>
             ))}
@@ -204,9 +205,9 @@ export default function App() {
                     ? "active"
                     : ""
                 }
-                onClick={() =>
-                  setSelected(document.id)
-                }
+                onClick={() => {
+                  setSelected(document.id);
+                }}
               >
                 <div className="row">
                   <strong>
@@ -215,9 +216,7 @@ export default function App() {
                   </strong>
 
                   <span
-                    className={
-                      `badge ${document.status}`
-                    }
+                    className={`badge ${document.status}`}
                   >
                     {document.status}
                   </span>
@@ -265,17 +264,21 @@ export default function App() {
   );
 }
 
+// --------------------
+// Document detail
+// --------------------
+
+type DetailProps = {
+  api: Api;
+  id: string;
+  onDone: () => Promise<void>;
+};
 
 function Detail({
   api,
   id,
   onDone,
-}: {
-  api: Api;
-  id: string;
-  onDone: () => void;
-}) {
-
+}: DetailProps) {
   const [doc, setDoc] =
     useState<DocDetail | null>(null);
 
@@ -286,7 +289,7 @@ function Detail({
     useState<Record<string, string>>({});
 
   const [comment, setComment] =
-    useState("");
+    useState<string>("");
 
   const [msg, setMsg] =
     useState<string | null>(null);
@@ -294,18 +297,17 @@ function Detail({
   const [
     authorizeException,
     setAuthorizeException,
-  ] = useState(false);
+  ] = useState<boolean>(false);
 
   const [
     exceptionReason,
     setExceptionReason,
-  ] = useState("");
+  ] = useState<string>("");
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (): Promise<void> => {
     try {
       const document = await api.get(id);
       setDoc(document);
-
     } catch (err) {
       setMsg(String(err));
     }
@@ -313,6 +315,7 @@ function Detail({
 
   useEffect(() => {
     setDoc(null);
+    setPdf(null);
     setEdits({});
     setComment("");
     setMsg(null);
@@ -320,12 +323,13 @@ function Detail({
     setAuthorizeException(false);
     setExceptionReason("");
 
-    load();
+    void load();
 
     let url: string | null = null;
     let cancelled = false;
 
-    api.fileUrl(id)
+    void api
+      .fileUrl(id)
       .then((newUrl) => {
         if (cancelled) {
           URL.revokeObjectURL(newUrl);
@@ -335,9 +339,10 @@ function Detail({
         url = newUrl;
         setPdf(newUrl);
       })
-      .catch(() => {
+      .catch((err: unknown) => {
         if (!cancelled) {
           setPdf(null);
+          setMsg(String(err));
         }
       });
 
@@ -353,21 +358,19 @@ function Detail({
   if (!doc) {
     return (
       <p className="muted">
-        Loading…
+        Loading...
       </p>
     );
   }
 
-  const invoice = (
-    doc.invoice ?? {}
-  ) as Record<string, unknown>;
+  const invoice: Record<string, unknown> =
+    doc.invoice ?? {};
 
   const awaiting =
     doc.status === "awaiting_review";
 
-  const matchFlags = (
-    doc.analysis?.match?.review_flags ?? []
-  ) as string[];
+  const matchFlags: string[] =
+    doc.analysis?.match?.review_flags ?? [];
 
   const hasChanges =
     Object.keys(edits).length > 0;
@@ -384,7 +387,7 @@ function Detail({
 
   async function act(
     action: ReviewAction
-  ) {
+  ): Promise<void> {
     if (!doc) return;
 
     try {
@@ -400,6 +403,7 @@ function Detail({
 
       if (
         action === "approve" &&
+        needsException &&
         authorizeException
       ) {
         body.exception_codes = matchFlags;
@@ -407,25 +411,21 @@ function Detail({
           exceptionReason.trim();
       }
 
-      await api.review(
-        doc.id,
-        body
-      );
+      await api.review(doc.id, body);
 
       setMsg(
-        `${action} submitted; the worker will ` +
-        "revalidate the invoice before execution."
+        `${action} submitted. The worker will ` +
+        "revalidate before execution."
       );
 
       setEdits({});
       setAuthorizeException(false);
       setExceptionReason("");
 
-      setTimeout(() => {
-        load();
-        onDone();
+      window.setTimeout(() => {
+        void load();
+        void onDone();
       }, 1500);
-
     } catch (err) {
       setMsg(String(err));
     }
@@ -436,12 +436,12 @@ function Detail({
       <div className="pdf">
         {pdf ? (
           <iframe
-            title="invoice"
+            title="Invoice preview"
             src={pdf}
           />
         ) : (
           <p className="muted">
-            No preview.
+            No preview available.
           </p>
         )}
       </div>
@@ -458,18 +458,14 @@ function Detail({
         </h2>
 
         <p className="muted small">
-          version {doc.version}
+          Version {doc.version}
           {" · "}
-          confidence {
-            doc.confidence?.toFixed(2) ?? "—"
-          }
-
-          {doc.analysis?.confidence
-            ?.calibrated === false &&
-            " (uncalibrated)"}
-
+          Confidence{" "}
+          {doc.confidence?.toFixed(2) ?? "—"}
+          {doc.analysis?.confidence?.calibrated ===
+            false && " (uncalibrated)"}
           {" · "}
-          gate {doc.decision?.gate ?? "—"}
+          Gate {doc.decision?.gate ?? "—"}
         </p>
 
         {doc.error && (
@@ -496,16 +492,15 @@ function Detail({
           <tbody>
             {FIELDS.map((field) => {
               const agreed =
-                doc.analysis?.field_agreement
-                  ?.[field];
+                doc.analysis?.field_agreement?.[
+                  field
+                ];
 
               return (
                 <tr key={field}>
                   <td
                     className={
-                      agreed === false
-                        ? "warn"
-                        : ""
+                      agreed === false ? "warn" : ""
                     }
                     title={
                       agreed === false
@@ -525,13 +520,12 @@ function Detail({
                           invoice[field] ?? ""
                         )
                       }
-                      onChange={(event) =>
+                      onChange={(event) => {
                         setEdits({
                           ...edits,
-                          [field]:
-                            event.target.value,
-                        })
-                      }
+                          [field]: event.target.value,
+                        });
+                      }}
                     />
                   </td>
                 </tr>
@@ -545,9 +539,9 @@ function Detail({
             <input
               placeholder="Comment (optional)"
               value={comment}
-              onChange={(event) =>
-                setComment(event.target.value)
-              }
+              onChange={(event) => {
+                setComment(event.target.value);
+              }}
             />
 
             {needsException && (
@@ -568,11 +562,11 @@ function Detail({
                   <input
                     type="checkbox"
                     checked={authorizeException}
-                    onChange={(event) =>
+                    onChange={(event) => {
                       setAuthorizeException(
                         event.target.checked
-                      )
-                    }
+                      );
+                    }}
                   />
 
                   I explicitly authorize these
@@ -585,20 +579,21 @@ function Detail({
                     "(at least 12 characters)"
                   }
                   value={exceptionReason}
-                  onChange={(event) =>
+                  onChange={(event) => {
                     setExceptionReason(
                       event.target.value
-                    )
-                  }
+                    );
+                  }}
                 />
               </div>
             )}
 
             <button
-              onClick={() => act("approve")}
+              onClick={() => {
+                void act("approve");
+              }}
               disabled={
-                hasChanges ||
-                !exceptionValid
+                hasChanges || !exceptionValid
               }
               title="Approver role required"
             >
@@ -606,7 +601,9 @@ function Detail({
             </button>
 
             <button
-              onClick={() => act("correct")}
+              onClick={() => {
+                void act("correct");
+              }}
               disabled={!hasChanges}
             >
               Save corrections
@@ -614,7 +611,9 @@ function Detail({
 
             <button
               className="danger"
-              onClick={() => act("reject")}
+              onClick={() => {
+                void act("reject");
+              }}
             >
               Reject
             </button>
@@ -664,13 +663,9 @@ function Detail({
                   event.created_at
                 ).toLocaleString()}
               </span>
-
               {" "}
-              <strong>
-                {event.event}
-              </strong>
+              <strong>{event.event}</strong>
               {" "}
-
               <span className="muted small">
                 by {event.actor}
               </span>
