@@ -41,6 +41,19 @@ class Settings(BaseSettings):
     ap_timeout_seconds: float = 10.0
     ap_api_token: str = "dev-ap-token"
 
+    
+    # AP provider.
+    ap_provider: str = "mock"
+
+    # QuickBooks sandbox.
+    qbo_company_id: str | None = None
+    qbo_access_token: str | None = None
+    qbo_tenant_slug: str = "acme"
+    qbo_vendor_id: str | None = None
+    qbo_vendor_name: str | None = None
+    qbo_expense_account_id: str | None = None
+
+
     # Shadow mode: decide everything, send nothing to AP. Use for the first weeks at a customer,
     # comparing the agent's decisions with what their AP team actually did.
     shadow_mode: bool = False
