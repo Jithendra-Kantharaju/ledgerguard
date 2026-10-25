@@ -1,7 +1,19 @@
 
 export const API_URL: string =
-  import.meta.env.VITE_API_URL ??
+  import.meta.env.VITE_API_URL?.replace(/\/$/, "") ||
   "http://localhost:8000";
+
+// --------------------
+// Types
+// --------------------
+
+export type UserInfo = {
+  id: string;
+  tenant_id: string;
+  email: string;
+  role: string;
+  approval_limit: string;
+};
 
 export type DocSummary = {
   id: string;
@@ -16,6 +28,7 @@ export type DocSummary = {
   reasons: string[];
   confidence: number | null;
   created_at: string;
+  updated_at?: string;
 };
 
 export type ReviewRequest = {
@@ -23,10 +36,28 @@ export type ReviewRequest = {
   expected_version: number;
   fields?: Record<string, unknown>;
   comment?: string;
-
-  // Human-approved matching exceptions.
   exception_codes?: string[];
   exception_reason?: string;
+};
+
+export type ReviewResponse = {
+  review_id: string;
+  status: string;
+};
+
+export type UploadResponse = DocSummary & {
+  duplicate_upload: boolean;
+};
+
+export type Analysis = {
+  match?: {
+    review_flags?: string[];
+  };
+  confidence?: {
+    calibrated?: boolean;
+  };
+  field_agreement?: Record<string, boolean | null>;
+  [key: string]: unknown;
 };
 
 export type DocDetail = DocSummary & {
@@ -36,11 +67,10 @@ export type DocDetail = DocSummary & {
     outcome: string;
     gate: string;
     reasons: string[];
-    confidence: number;
+    confidence: number | null;
   } | null;
 
-  analysis: any;
-
+  analysis: Analysis | null;
   error: string | null;
 
   reviews: {
@@ -56,7 +86,7 @@ export type DocDetail = DocSummary & {
   audit: {
     actor: string;
     event: string;
-    data: any;
+    data: Record<string, unknown>;
     created_at: string;
   }[];
 
@@ -69,102 +99,107 @@ export type DocDetail = DocSummary & {
   }[];
 };
 
+// --------------------
+// API Client
+// --------------------
 
 export class Api {
-  constructor(
-    private key: string
-  ) {}
+  constructor(private readonly key: string) {}
 
   private async req(
     path: string,
     init: RequestInit = {}
   ): Promise<Response> {
+    const headers = new Headers(init.headers);
+
+    headers.set("X-API-Key", this.key);
 
     const response = await fetch(
-      API_URL + path,
+      `${API_URL}${path}`,
       {
         ...init,
-        headers: {
-          "X-API-Key": this.key,
-          ...(init.headers ?? {}),
-        },
+        headers,
       }
     );
 
     if (!response.ok) {
-      let detail = response.statusText;
+      let detail: string = response.statusText;
 
       try {
-        const data = await response.json();
+        const data: unknown = await response.json();
 
-        detail = data.detail ?? detail;
+        if (
+          typeof data === "object" &&
+          data !== null &&
+          "detail" in data
+        ) {
+          const value = data.detail;
 
+          detail =
+            typeof value === "string"
+              ? value
+              : JSON.stringify(value);
+        }
       } catch {
-        // Response did not contain JSON.
+        // Server did not return valid JSON.
       }
 
       throw new Error(
-        `${response.status}: ${
-          typeof detail === "string"
-            ? detail
-            : JSON.stringify(detail)
-        }`
+        `API error ${response.status}: ${detail}`
       );
     }
 
     return response;
   }
 
-  me = async () =>
-    (
-      await this.req("/me")
-    ).json();
+  // Current authenticated user
+  async me(): Promise<UserInfo> {
+    const response = await this.req("/me");
+    return response.json();
+  }
 
-  list = async (
-    status: string
-  ): Promise<DocSummary[]> =>
-    (
-      await this.req(
-        `/documents${
-          status
-            ? `?status=${encodeURIComponent(status)}`
-            : ""
-        }`
-      )
-    ).json();
-
-  get = async (
-    id: string
-  ): Promise<DocDetail> =>
-    (
-      await this.req(
-        `/documents/${id}`
-      )
-    ).json();
-
-  fileUrl = async (
-    id: string
-  ): Promise<string> => {
+  // List documents
+  async list(
+    status: string = ""
+  ): Promise<DocSummary[]> {
+    const query = status
+      ? `?status=${encodeURIComponent(status)}`
+      : "";
 
     const response = await this.req(
-      `/documents/${id}/file`
+      `/documents${query}`
+    );
+
+    return response.json();
+  }
+
+  // Get document details
+  async get(id: string): Promise<DocDetail> {
+    const response = await this.req(
+      `/documents/${encodeURIComponent(id)}`
+    );
+
+    return response.json();
+  }
+
+  // Get invoice PDF preview
+  async fileUrl(id: string): Promise<string> {
+    const response = await this.req(
+      `/documents/${encodeURIComponent(id)}/file`
     );
 
     const blob = await response.blob();
 
     return URL.createObjectURL(blob);
-  };
+  }
 
-  upload = async (
+  // Upload invoice
+  async upload(
     file: File
-  ) => {
-
+  ): Promise<UploadResponse> {
     const body = new FormData();
 
-    body.append(
-      "file",
-      file
-    );
+    body.append("file", file);
 
     const response = await this.req(
       "/documents",
@@ -175,15 +210,15 @@ export class Api {
     );
 
     return response.json();
-  };
+  }
 
-  review = async (
+  // Submit human review
+  async review(
     id: string,
     body: ReviewRequest
-  ) => {
-
+  ): Promise<ReviewResponse> {
     const response = await this.req(
-      `/documents/${id}/review`,
+      `/documents/${encodeURIComponent(id)}/review`,
       {
         method: "POST",
         headers: {
@@ -194,5 +229,5 @@ export class Api {
     );
 
     return response.json();
-  };
+  }
 }
