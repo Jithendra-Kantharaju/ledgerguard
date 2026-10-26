@@ -15,6 +15,18 @@ import type {
   UserInfo,
 } from "./api";
 
+import {
+  cognitoEnabled,
+  initializeAuth,
+  login,
+  logout,
+} from "./auth";
+
+
+// --------------------------------------------------
+// Constants
+// --------------------------------------------------
+
 const STATUSES = [
   "awaiting_review",
   "",
@@ -38,33 +50,67 @@ const FIELDS = [
   "total",
 ];
 
+const REQUIRED_APPROVAL_FIELDS = [
+  "invoice_number",
+  "vendor_name",
+  "po_number",
+  "invoice_date",
+  "currency",
+  "total",
+];
+
 type ReviewAction =
   | "approve"
   | "correct"
   | "reject";
 
+
+// --------------------------------------------------
+// Local authentication helpers
+// --------------------------------------------------
+
 function loadKey(): string {
+  if (cognitoEnabled) {
+    return "";
+  }
+
   try {
-    return localStorage.getItem("ap-api-key") ?? "";
+    return (
+      localStorage.getItem("ap-api-key") ?? ""
+    );
   } catch {
     return "";
   }
 }
 
+
 function saveKey(key: string): void {
+  if (cognitoEnabled) {
+    return;
+  }
+
   try {
-    localStorage.setItem("ap-api-key", key);
+    localStorage.setItem(
+      "ap-api-key",
+      key
+    );
   } catch {
-    // Browser storage unavailable.
+    // Local browser storage unavailable.
   }
 }
 
-// --------------------
+
+// --------------------------------------------------
 // Main application
-// --------------------
+// --------------------------------------------------
 
 export default function App() {
-  const [key, setKey] = useState<string>(loadKey);
+  const [key, setKey] = useState<string>(
+    loadKey
+  );
+
+  const [authReady, setAuthReady] =
+    useState<boolean>(!cognitoEnabled);
 
   const [user, setUser] =
     useState<UserInfo | null>(null);
@@ -86,93 +132,226 @@ export default function App() {
     [key]
   );
 
-  const refresh = useCallback(async (): Promise<void> => {
-    if (!key) {
-      setUser(null);
-      setDocs([]);
+  // ------------------------------------------------
+  // Initialize Cognito authentication
+  // ------------------------------------------------
+
+  useEffect(() => {
+    if (!cognitoEnabled) {
+      setAuthReady(true);
       return;
     }
 
-    try {
-      const [currentUser, documents] =
-        await Promise.all([
-          api.me(),
-          api.list(status),
-        ]);
+    let active = true;
 
-      setUser(currentUser);
-      setDocs(documents);
-      setError(null);
-    } catch (err) {
-      setError(String(err));
-    }
-  }, [api, key, status]);
+    void initializeAuth()
+      .then((token: string) => {
+        if (!active) return;
+
+        setKey(token);
+        setAuthReady(true);
+        setError(null);
+      })
+      .catch((err: unknown) => {
+        if (!active) return;
+
+        setKey("");
+        setAuthReady(true);
+        setError(String(err));
+      });
+
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  // ------------------------------------------------
+  // Refresh user and documents
+  // ------------------------------------------------
+
+  const refresh = useCallback(
+    async (): Promise<void> => {
+      if (!authReady || !key) {
+        setUser(null);
+        setDocs([]);
+        return;
+      }
+
+      try {
+        const [currentUser, documents] =
+          await Promise.all([
+            api.me(),
+            api.list(status),
+          ]);
+
+        setUser(currentUser);
+        setDocs(documents);
+        setError(null);
+      } catch (err) {
+        const message = String(err);
+
+        setError(message);
+
+        // An expired Cognito access token
+        // requires another login.
+        if (
+          cognitoEnabled &&
+          (
+            message.includes("401") ||
+            message.includes("403")
+          )
+        ) {
+          setKey("");
+          setUser(null);
+          setDocs([]);
+          setSelected(null);
+        }
+      }
+    },
+    [api, authReady, key, status]
+  );
 
   useEffect(() => {
     void refresh();
 
-    const timer = window.setInterval(() => {
-      void refresh();
-    }, 5000);
+    if (!key || !authReady) {
+      return;
+    }
+
+    const timer = window.setInterval(
+      () => {
+        void refresh();
+      },
+      5000
+    );
 
     return () => {
       window.clearInterval(timer);
     };
-  }, [refresh]);
+  }, [refresh, key, authReady]);
+
+  // ------------------------------------------------
+  // Upload PDF
+  // ------------------------------------------------
 
   async function handleUpload(
     file: File
   ): Promise<void> {
+    if (!key) {
+      setError("Sign in before uploading.");
+      return;
+    }
+
     try {
       await api.upload(file);
+
       await refresh();
+
       setError(null);
     } catch (err) {
       setError(String(err));
     }
   }
 
+  // ------------------------------------------------
+  // Authentication controls
+  // ------------------------------------------------
+
+  function renderAuthControls() {
+    if (cognitoEnabled) {
+      if (!authReady) {
+        return (
+          <span className="muted">
+            Checking sign-in...
+          </span>
+        );
+      }
+
+      if (key) {
+        return (
+          <button
+            type="button"
+            onClick={() => {
+              logout();
+            }}
+          >
+            Sign out
+          </button>
+        );
+      }
+
+      return (
+        <button
+          type="button"
+          onClick={() => {
+            void login().catch(
+              (err: unknown) => {
+                setError(String(err));
+              }
+            );
+          }}
+        >
+          Sign in with Cognito
+        </button>
+      );
+    }
+
+    return (
+      <input
+        type="password"
+        placeholder="X-API-Key"
+        value={key}
+        onChange={(event) => {
+          const value = event.target.value;
+
+          setKey(value);
+          saveKey(value);
+        }}
+      />
+    );
+  }
+
+  // ------------------------------------------------
+  // Main UI
+  // ------------------------------------------------
+
   return (
     <div className="app">
       <header>
         <h1>LedgerGuard AP Review</h1>
 
-        <input
-          type="password"
-          placeholder="X-API-Key"
-          value={key}
-          onChange={(event) => {
-            const value = event.target.value;
-
-            setKey(value);
-            saveKey(value);
-          }}
-        />
+        {renderAuthControls()}
 
         {user && (
           <span className="who">
-            {user.email} · {user.role} · limit{" "}
-            {user.approval_limit}
+            {user.email}
+            {" · "}
+            {user.role}
+            {" · "}
+            limit {user.approval_limit}
           </span>
         )}
 
-        <label className="upload">
-          Upload PDF
+        {key && (
+          <label className="upload">
+            Upload PDF
 
-          <input
-            type="file"
-            accept="application/pdf"
-            onChange={(event) => {
-              const file = event.target.files?.[0];
+            <input
+              type="file"
+              accept="application/pdf"
+              onChange={(event) => {
+                const file =
+                  event.target.files?.[0];
 
-              if (!file) return;
+                if (!file) return;
 
-              void handleUpload(file);
+                void handleUpload(file);
 
-              event.target.value = "";
-            }}
-          />
-        </label>
+                event.target.value = "";
+              }}
+            />
+          </label>
+        )}
       </header>
 
       {error && (
@@ -181,102 +360,132 @@ export default function App() {
         </div>
       )}
 
-      <main>
-        <aside>
-          <select
-            value={status}
-            onChange={(event) => {
-              setStatus(event.target.value);
-            }}
-          >
-            {STATUSES.map((item) => (
-              <option key={item} value={item}>
-                {item || "all"}
-              </option>
-            ))}
-          </select>
-
-          <ul>
-            {docs.map((document) => (
-              <li
-                key={document.id}
-                className={
-                  document.id === selected
-                    ? "active"
-                    : ""
-                }
-                onClick={() => {
-                  setSelected(document.id);
-                }}
-              >
-                <div className="row">
-                  <strong>
-                    {document.vendor_name ??
-                      document.filename}
-                  </strong>
-
-                  <span
-                    className={`badge ${document.status}`}
-                  >
-                    {document.status}
-                  </span>
-                </div>
-
-                <div className="muted">
-                  {document.invoice_number ?? "—"}
-                  {" · "}
-                  {document.total ?? "?"}
-                  {" "}
-                  {document.currency ?? ""}
-                </div>
-
-                <div className="muted small">
-                  {document.reasons
-                    .slice(0, 2)
-                    .join("; ")}
-                </div>
-              </li>
-            ))}
-
-            {docs.length === 0 && (
-              <li className="muted">
-                Nothing here.
-              </li>
-            )}
-          </ul>
-        </aside>
-
-        <section>
-          {selected ? (
-            <Detail
-              api={api}
-              id={selected}
-              onDone={refresh}
-            />
-          ) : (
+      {!authReady ? (
+        <main>
+          <section>
             <p className="muted">
-              Select a document.
+              Initializing authentication...
             </p>
-          )}
-        </section>
-      </main>
+          </section>
+        </main>
+      ) : !key ? (
+        <main>
+          <section>
+            <p className="muted">
+              {cognitoEnabled
+                ? "Sign in with Cognito to access LedgerGuard."
+                : "Enter your local API key to continue."}
+            </p>
+          </section>
+        </main>
+      ) : (
+        <main>
+          <aside>
+            <select
+              value={status}
+              onChange={(event) => {
+                setStatus(event.target.value);
+              }}
+            >
+              {STATUSES.map((item) => (
+                <option
+                  key={item}
+                  value={item}
+                >
+                  {item || "all"}
+                </option>
+              ))}
+            </select>
+
+            <ul>
+              {docs.map((document) => (
+                <li
+                  key={document.id}
+                  className={
+                    document.id === selected
+                      ? "active"
+                      : ""
+                  }
+                  onClick={() => {
+                    setSelected(document.id);
+                  }}
+                >
+                  <div className="row">
+                    <strong>
+                      {document.vendor_name ??
+                        document.filename}
+                    </strong>
+
+                    <span
+                      className={
+                        `badge ${document.status}`
+                      }
+                    >
+                      {document.status}
+                    </span>
+                  </div>
+
+                  <div className="muted">
+                    {document.invoice_number ?? "—"}
+                    {" · "}
+                    {document.total ?? "?"}
+                    {" "}
+                    {document.currency ?? ""}
+                  </div>
+
+                  <div className="muted small">
+                    {document.reasons
+                      .slice(0, 2)
+                      .join("; ")}
+                  </div>
+                </li>
+              ))}
+
+              {docs.length === 0 && (
+                <li className="muted">
+                  Nothing here.
+                </li>
+              )}
+            </ul>
+          </aside>
+
+          <section>
+            {selected ? (
+              <Detail
+                api={api}
+                id={selected}
+                role={user?.role}
+                onDone={refresh}
+              />
+            ) : (
+              <p className="muted">
+                Select a document.
+              </p>
+            )}
+          </section>
+        </main>
+      )}
     </div>
   );
 }
 
-// --------------------
-// Document detail
-// --------------------
+
+// --------------------------------------------------
+// Document Detail Component
+// --------------------------------------------------
 
 type DetailProps = {
   api: Api;
   id: string;
+  role?: string;
   onDone: () => Promise<void>;
 };
+
 
 function Detail({
   api,
   id,
+  role,
   onDone,
 }: DetailProps) {
   const [doc, setDoc] =
@@ -304,14 +513,26 @@ function Detail({
     setExceptionReason,
   ] = useState<string>("");
 
-  const load = useCallback(async (): Promise<void> => {
-    try {
-      const document = await api.get(id);
-      setDoc(document);
-    } catch (err) {
-      setMsg(String(err));
-    }
-  }, [api, id]);
+  // ------------------------------------------------
+  // Load current document
+  // ------------------------------------------------
+
+  const load = useCallback(
+    async (): Promise<void> => {
+      try {
+        const document = await api.get(id);
+
+        setDoc(document);
+      } catch (err) {
+        setMsg(String(err));
+      }
+    },
+    [api, id]
+  );
+
+  // ------------------------------------------------
+  // Load document and PDF preview
+  // ------------------------------------------------
 
   useEffect(() => {
     setDoc(null);
@@ -330,7 +551,7 @@ function Detail({
 
     void api
       .fileUrl(id)
-      .then((newUrl) => {
+      .then((newUrl: string) => {
         if (cancelled) {
           URL.revokeObjectURL(newUrl);
           return;
@@ -363,6 +584,10 @@ function Detail({
     );
   }
 
+  // ------------------------------------------------
+  // Current invoice and approval checks
+  // ------------------------------------------------
+
   const invoice: Record<string, unknown> =
     doc.invoice ?? {};
 
@@ -378,6 +603,23 @@ function Detail({
   const needsException =
     matchFlags.length > 0;
 
+  const canUserApprove =
+    role === "approver" ||
+    role === "admin";
+
+  const missingRequiredFields =
+    REQUIRED_APPROVAL_FIELDS.filter(
+      (field) => {
+        const value = invoice[field];
+
+        return (
+          value === null ||
+          value === undefined ||
+          value === ""
+        );
+      }
+    );
+
   const exceptionValid =
     !needsException ||
     (
@@ -385,10 +627,30 @@ function Detail({
       exceptionReason.trim().length >= 12
     );
 
+  const canApprove =
+    awaiting &&
+    canUserApprove &&
+    !hasChanges &&
+    exceptionValid &&
+    missingRequiredFields.length === 0;
+
+  // ------------------------------------------------
+  // Human review actions
+  // ------------------------------------------------
+
   async function act(
     action: ReviewAction
   ): Promise<void> {
     if (!doc) return;
+
+    if (action === "approve" && !canApprove) {
+      setMsg(
+        "Approval is not permitted until required " +
+        "fields and matching exceptions are resolved."
+      );
+
+      return;
+    }
 
     try {
       const body: ReviewRequest = {
@@ -407,15 +669,18 @@ function Detail({
         authorizeException
       ) {
         body.exception_codes = matchFlags;
+
         body.exception_reason =
           exceptionReason.trim();
       }
 
-      await api.review(doc.id, body);
+      await api.review(
+        doc.id,
+        body
+      );
 
       setMsg(
-        `${action} submitted. The worker will ` +
-        "revalidate before execution."
+        `${action} submitted. Worker revalidation is pending.`
       );
 
       setEdits({});
@@ -430,6 +695,10 @@ function Detail({
       setMsg(String(err));
     }
   }
+
+  // ------------------------------------------------
+  // Document UI
+  // ------------------------------------------------
 
   return (
     <div className="detail">
@@ -462,8 +731,10 @@ function Detail({
           {" · "}
           Confidence{" "}
           {doc.confidence?.toFixed(2) ?? "—"}
+
           {doc.analysis?.confidence?.calibrated ===
             false && " (uncalibrated)"}
+
           {" · "}
           Gate {doc.decision?.gate ?? "—"}
         </p>
@@ -500,7 +771,9 @@ function Detail({
                 <tr key={field}>
                   <td
                     className={
-                      agreed === false ? "warn" : ""
+                      agreed === false
+                        ? "warn"
+                        : ""
                     }
                     title={
                       agreed === false
@@ -543,6 +816,20 @@ function Detail({
                 setComment(event.target.value);
               }}
             />
+
+            {missingRequiredFields.length > 0 && (
+              <div className="exception-review">
+                <strong>
+                  Corrections required
+                </strong>
+
+                <p className="small">
+                  Complete these fields before approval:
+                  {" "}
+                  {missingRequiredFields.join(", ")}
+                </p>
+              </div>
+            )}
 
             {needsException && (
               <div className="exception-review">
@@ -589,18 +876,22 @@ function Detail({
             )}
 
             <button
+              type="button"
               onClick={() => {
                 void act("approve");
               }}
-              disabled={
-                hasChanges || !exceptionValid
+              disabled={!canApprove}
+              title={
+                canUserApprove
+                  ? "Approve after validation"
+                  : "Approver role required"
               }
-              title="Approver role required"
             >
               Approve
             </button>
 
             <button
+              type="button"
               onClick={() => {
                 void act("correct");
               }}
@@ -610,6 +901,7 @@ function Detail({
             </button>
 
             <button
+              type="button"
               className="danger"
               onClick={() => {
                 void act("reject");
@@ -664,7 +956,9 @@ function Detail({
                 ).toLocaleString()}
               </span>
               {" "}
-              <strong>{event.event}</strong>
+              <strong>
+                {event.event}
+              </strong>
               {" "}
               <span className="muted small">
                 by {event.actor}
