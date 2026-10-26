@@ -1,5 +1,14 @@
 
-"""HTTP API for invoices, tenant access and human reviews."""
+"""LedgerGuard FastAPI application.
+
+Features:
+- Local API-key and AWS Cognito authentication
+- Tenant-scoped database access through PostgreSQL RLS
+- PDF invoice upload and retrieval
+- Document review and approval
+- Audited matching exceptions
+- Invoice processing status and audit history
+"""
 
 from __future__ import annotations
 
@@ -18,7 +27,7 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.db.core import audit, pool, tx
 from app.pipeline.parse import sha256
@@ -27,8 +36,13 @@ from app.storage import get_storage
 from app.tracing import configure_tracing
 from app.worker import queue
 
+
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 
+
+# --------------------------------------------------
+# Application lifecycle
+# --------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -37,18 +51,41 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(
-    title="AP Invoice Agent",
-    version="0.1.0",
+    title="LedgerGuard AP Invoice Agent",
+    description=(
+        "Enterprise AI-powered accounts payable "
+        "automation with human approval and "
+        "auditable execution."
+    ),
+    version="0.2.0",
     lifespan=lifespan,
 )
 
+
+# --------------------------------------------------
+# CORS
+# --------------------------------------------------
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=get_settings().cors_origins.split(","),
+    allow_origins=[
+        origin.strip()
+        for origin in get_settings().cors_origins.split(",")
+        if origin.strip()
+    ],
+    allow_credentials=False,
     allow_methods=["GET", "POST"],
-    allow_headers=["X-API-Key", "Content-Type"],
+    allow_headers=[
+        "Authorization",
+        "X-API-Key",
+        "Content-Type",
+    ],
 )
 
+
+# --------------------------------------------------
+# User model
+# --------------------------------------------------
 
 class User(BaseModel):
     id: str
@@ -59,16 +96,54 @@ class User(BaseModel):
 
 
 def hash_key(key: str) -> str:
-    return hashlib.sha256(key.encode()).hexdigest()
+    return hashlib.sha256(
+        key.encode("utf-8")
+    ).hexdigest()
 
+
+# --------------------------------------------------
+# Authentication
+# --------------------------------------------------
 
 def current_user(
-    x_api_key: str | None = Header(None),
+    x_api_key: str | None = Header(default=None),
+    authorization: str | None = Header(default=None),
 ) -> User:
+    """
+    Local development:
+        AUTH_MODE=api_key
+        X-API-Key: <local-key>
+
+    AWS deployment:
+        AUTH_MODE=cognito
+        Authorization: Bearer <access-token>
+
+    API keys are never accepted in Cognito mode.
+    """
+
+    settings = get_settings()
+
+    # AWS Cognito authentication
+    if settings.auth_mode == "cognito":
+        from app.api.cognito_auth import get_cognito_user
+
+        identity = get_cognito_user(
+            authorization
+        )
+
+        return User(**identity)
+
+    # Local development authentication
+    if settings.auth_mode != "api_key":
+        raise HTTPException(
+            status_code=503,
+            detail="Unsupported authentication configuration",
+        )
+
     if not x_api_key:
         raise HTTPException(
-            401,
-            "missing X-API-Key",
+            status_code=401,
+            detail="Missing X-API-Key",
         )
 
     with tx() as conn:
@@ -83,70 +158,120 @@ def current_user(
         ).fetchone()
 
     if not key:
-        raise HTTPException(401, "invalid API key")
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid API key",
+        )
 
-    with tx(str(key["tenant_id"])) as conn:
-        u = conn.execute(
+    tenant_id = str(key["tenant_id"])
+
+    with tx(tenant_id) as conn:
+        user = conn.execute(
             """
             SELECT *
             FROM users
-            WHERE id = %s AND active
+            WHERE id = %s
+              AND active = true
             """,
             (key["user_id"],),
         ).fetchone()
 
-    if not u:
-        raise HTTPException(401, "inactive user")
+    if not user:
+        raise HTTPException(
+            status_code=401,
+            detail="Inactive user",
+        )
 
     return User(
-        id=str(u["id"]),
-        tenant_id=str(u["tenant_id"]),
-        email=u["email"],
-        role=u["role"],
-        approval_limit=str(u["approval_limit"]),
+        id=str(user["id"]),
+        tenant_id=str(user["tenant_id"]),
+        email=user["email"],
+        role=user["role"],
+        approval_limit=str(user["approval_limit"]),
     )
 
 
-def _doc_summary(d: dict) -> dict[str, Any]:
-    inv = d.get("invoice") or {}
-    dec = d.get("decision") or {}
+# --------------------------------------------------
+# Document summary
+# --------------------------------------------------
+
+def _doc_summary(
+    document: dict,
+) -> dict[str, Any]:
+    invoice = document.get("invoice") or {}
+    decision = document.get("decision") or {}
 
     return {
-        "id": str(d["id"]),
-        "filename": d["filename"],
-        "status": d["status"],
-        "version": d["version"],
-        "invoice_number": inv.get("invoice_number"),
-        "vendor_name": inv.get("vendor_name"),
-        "total": inv.get("total"),
-        "currency": inv.get("currency"),
-        "outcome": dec.get("outcome"),
-        "reasons": dec.get("reasons", []),
-        "confidence": dec.get("confidence"),
-        "created_at": d["created_at"].isoformat(),
-        "updated_at": d["updated_at"].isoformat(),
+        "id": str(document["id"]),
+        "filename": document["filename"],
+        "status": document["status"],
+        "version": document["version"],
+        "invoice_number": invoice.get(
+            "invoice_number"
+        ),
+        "vendor_name": invoice.get(
+            "vendor_name"
+        ),
+        "total": invoice.get("total"),
+        "currency": invoice.get("currency"),
+        "outcome": decision.get("outcome"),
+        "reasons": decision.get("reasons", []),
+        "confidence": decision.get("confidence"),
+        "created_at": document[
+            "created_at"
+        ].isoformat(),
+        "updated_at": document[
+            "updated_at"
+        ].isoformat(),
     }
 
 
+# --------------------------------------------------
+# Health checks
+# --------------------------------------------------
+
 @app.get("/healthz")
 def healthz():
-    return {"ok": True}
+    return {
+        "ok": True
+    }
 
 
 @app.get("/readyz")
 def readyz():
-    with pool().connection() as conn:
-        conn.execute("SELECT 1")
+    try:
+        with pool().connection() as conn:
+            conn.execute("SELECT 1")
+    except Exception:
+        raise HTTPException(
+            status_code=503,
+            detail="Database unavailable",
+        )
 
-    return {"ok": True}
+    return {
+        "ok": True
+    }
 
 
-@app.get("/me")
-def me(user: User = Depends(current_user)):
+# --------------------------------------------------
+# Authenticated user information
+# --------------------------------------------------
+
+@app.get("/me", response_model=User)
+def me(
+    user: User = Depends(current_user),
+):
     return user
 
 
-@app.post("/documents", status_code=202)
+# --------------------------------------------------
+# Invoice upload
+# --------------------------------------------------
+
+@app.post(
+    "/documents",
+    status_code=202,
+)
 def upload(
     file: UploadFile = File(...),
     user: User = Depends(current_user),
@@ -158,25 +283,39 @@ def upload(
         "admin",
     ):
         raise HTTPException(
-            403,
-            "not allowed to upload",
+            status_code=403,
+            detail="Not allowed to upload",
         )
 
-    data = file.file.read(MAX_UPLOAD_BYTES + 1)
+    data = file.file.read(
+        MAX_UPLOAD_BYTES + 1
+    )
 
     if len(data) > MAX_UPLOAD_BYTES:
-        raise HTTPException(413, "file too large")
+        raise HTTPException(
+            status_code=413,
+            detail="File too large",
+        )
 
     if not data.startswith(b"%PDF"):
         raise HTTPException(
-            415,
-            "only PDF files are accepted",
+            status_code=415,
+            detail="Only PDF files are accepted",
         )
 
     digest = sha256(data)
-    key = f"{user.tenant_id}/{digest}.pdf"
 
-    get_storage().put(key, data)
+    # Tenant-specific content-addressed storage.
+    storage_key = (
+        f"{user.tenant_id}/{digest}.pdf"
+    )
+
+    # Local mode uses shared storage.
+    # AWS mode uses S3 through the configured backend.
+    get_storage().put(
+        storage_key,
+        data,
+    )
 
     with tx(user.tenant_id) as conn:
         row = conn.execute(
@@ -188,7 +327,9 @@ def upload(
                 storage_key,
                 status
             )
-            VALUES (%s, %s, %s, %s, 'queued')
+            VALUES (
+                %s, %s, %s, %s, 'queued'
+            )
             ON CONFLICT (tenant_id, sha256)
             DO NOTHING
             RETURNING *
@@ -197,12 +338,13 @@ def upload(
                 user.tenant_id,
                 digest,
                 (file.filename or "upload.pdf")[:255],
-                key,
+                storage_key,
             ),
         ).fetchone()
 
+        # Do not reprocess an identical upload.
         if row is None:
-            row = conn.execute(
+            existing = conn.execute(
                 """
                 SELECT *
                 FROM documents
@@ -211,8 +353,14 @@ def upload(
                 (digest,),
             ).fetchone()
 
+            if existing is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Duplicate lookup failed",
+                )
+
             return {
-                **_doc_summary(row),
+                **_doc_summary(existing),
                 "duplicate_upload": True,
             }
 
@@ -241,10 +389,14 @@ def upload(
     }
 
 
+# --------------------------------------------------
+# List documents
+# --------------------------------------------------
+
 @app.get("/documents")
 def list_documents(
-    status: str | None = Query(None),
-    limit: int = Query(50, le=200),
+    status: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
     user: User = Depends(current_user),
 ):
     with tx(user.tenant_id) as conn:
@@ -270,8 +422,15 @@ def list_documents(
                 (limit,),
             ).fetchall()
 
-    return [_doc_summary(r) for r in rows]
+    return [
+        _doc_summary(row)
+        for row in rows
+    ]
 
+
+# --------------------------------------------------
+# Document details
+# --------------------------------------------------
 
 @app.get("/documents/{document_id}")
 def get_document(
@@ -279,7 +438,7 @@ def get_document(
     user: User = Depends(current_user),
 ):
     with tx(user.tenant_id) as conn:
-        d = conn.execute(
+        document = conn.execute(
             """
             SELECT *
             FROM documents
@@ -288,14 +447,20 @@ def get_document(
             (document_id,),
         ).fetchone()
 
-        if not d:
-            raise HTTPException(404, "not found")
+        if not document:
+            raise HTTPException(
+                status_code=404,
+                detail="Document not found",
+            )
 
         reviews = conn.execute(
             """
-            SELECT r.*, u.email
+            SELECT
+                r.*,
+                u.email
             FROM reviews r
-            JOIN users u ON u.id = r.user_id
+            JOIN users u
+              ON u.id = r.user_id
             WHERE r.document_id = %s
             ORDER BY r.created_at
             """,
@@ -304,7 +469,11 @@ def get_document(
 
         events = conn.execute(
             """
-            SELECT actor, event, data, created_at
+            SELECT
+                actor,
+                event,
+                data,
+                created_at
             FROM audit_log
             WHERE document_id = %s
             ORDER BY id
@@ -327,8 +496,9 @@ def get_document(
             (document_id,),
         ).fetchall()
 
-    analysis = d["analysis"] or {}
+    analysis = document["analysis"] or {}
 
+    # Avoid returning the entire parsed PDF text.
     if analysis.get("parsed"):
         analysis = {
             **analysis,
@@ -339,33 +509,43 @@ def get_document(
         }
 
     return {
-        **_doc_summary(d),
-        "invoice": d["invoice"],
-        "decision": d["decision"],
+        **_doc_summary(document),
+        "invoice": document["invoice"],
+        "decision": document["decision"],
         "analysis": analysis,
-        "error": d["error"],
+        "error": document["error"],
         "reviews": [
             {
-                "id": str(r["id"]),
-                "user": r["email"],
-                "action": r["action"],
-                "document_version": r["document_version"],
-                "comment": r["comment"],
-                "outcome": r["outcome"],
-                "created_at": r["created_at"].isoformat(),
+                "id": str(review["id"]),
+                "user": review["email"],
+                "action": review["action"],
+                "document_version": review[
+                    "document_version"
+                ],
+                "comment": review["comment"],
+                "outcome": review["outcome"],
+                "created_at": review[
+                    "created_at"
+                ].isoformat(),
             }
-            for r in reviews
+            for review in reviews
         ],
         "audit": [
             {
-                **e,
-                "created_at": e["created_at"].isoformat(),
+                **event,
+                "created_at": event[
+                    "created_at"
+                ].isoformat(),
             }
-            for e in events
+            for event in events
         ],
         "outbox": outbox,
     }
 
+
+# --------------------------------------------------
+# Download or preview invoice
+# --------------------------------------------------
 
 @app.get("/documents/{document_id}/file")
 def get_file(
@@ -373,38 +553,61 @@ def get_file(
     user: User = Depends(current_user),
 ):
     with tx(user.tenant_id) as conn:
-        d = conn.execute(
+        document = conn.execute(
             """
-            SELECT storage_key, filename
+            SELECT storage_key
             FROM documents
             WHERE id = %s
             """,
             (document_id,),
         ).fetchone()
 
-    if not d:
-        raise HTTPException(404, "not found")
+    if not document:
+        raise HTTPException(
+            status_code=404,
+            detail="Document not found",
+        )
+
+    data = get_storage().get(
+        document["storage_key"]
+    )
 
     return Response(
-        get_storage().get(d["storage_key"]),
+        content=data,
         media_type="application/pdf",
         headers={
             "Content-Disposition":
-                f'inline; filename="{document_id}.pdf"'
+                f'inline; filename="{document_id}.pdf"',
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
         },
     )
 
 
+# --------------------------------------------------
+# Human review schema
+# --------------------------------------------------
+
 class ReviewIn(BaseModel):
-    action: Literal["approve", "reject", "correct"]
-    expected_version: int
+    action: Literal[
+        "approve",
+        "reject",
+        "correct",
+    ]
+
+    expected_version: int = Field(ge=1)
+
     fields: dict[str, Any] | None = None
     comment: str | None = None
 
-    # Explicit human matching exceptions.
+    # Explicit human approval of matching exceptions.
     exception_codes: list[str] | None = None
     exception_reason: str | None = None
 
+
+# --------------------------------------------------
+# Submit human review
+# --------------------------------------------------
 
 @app.post(
     "/documents/{document_id}/review",
@@ -416,10 +619,10 @@ def review(
     user: User = Depends(current_user),
 ):
     """
-    Save a review and queue it for worker revalidation.
+    Store human review and enqueue the worker.
 
-    Approval is not execution. The worker checks source
-    evidence and permissions again before creating a bill.
+    The worker revalidates all business evidence
+    before allowing external AP execution.
     """
 
     if user.role not in (
@@ -428,8 +631,8 @@ def review(
         "admin",
     ):
         raise HTTPException(
-            403,
-            "not allowed to review",
+            status_code=403,
+            detail="Not allowed to review",
         )
 
     if (
@@ -437,14 +640,17 @@ def review(
         and user.role not in ("approver", "admin")
     ):
         raise HTTPException(
-            403,
-            "approving needs the approver role",
+            status_code=403,
+            detail="Approver role required",
         )
 
-    if body.action == "correct" and not body.fields:
+    if (
+        body.action == "correct"
+        and not body.fields
+    ):
         raise HTTPException(
-            422,
-            "correct needs fields",
+            status_code=422,
+            detail="Corrections require fields",
         )
 
     if (
@@ -452,9 +658,11 @@ def review(
         and body.action != "approve"
     ):
         raise HTTPException(
-            422,
-            "matching exceptions can only be "
-            "submitted with approval",
+            status_code=422,
+            detail=(
+                "Matching exceptions can only "
+                "be submitted with approval"
+            ),
         )
 
     if (
@@ -464,13 +672,24 @@ def review(
         ) < 12
     ):
         raise HTTPException(
-            422,
-            "matching exceptions require "
-            "a reason of at least 12 characters",
+            status_code=422,
+            detail=(
+                "Matching exceptions require "
+                "a reason of at least 12 characters"
+            ),
+        )
+
+    if body.exception_codes and (
+        len(body.exception_codes)
+        != len(set(body.exception_codes))
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Duplicate matching exception codes",
         )
 
     with tx(user.tenant_id) as conn:
-        d = conn.execute(
+        document = conn.execute(
             """
             SELECT *
             FROM documents
@@ -480,25 +699,33 @@ def review(
             (document_id,),
         ).fetchone()
 
-        if not d:
-            raise HTTPException(404, "not found")
-
-        if d["status"] != "awaiting_review":
+        if not document:
             raise HTTPException(
-                409,
-                f"document is {d['status']}, "
-                "not awaiting review",
+                status_code=404,
+                detail="Document not found",
             )
 
-        if d["version"] != body.expected_version:
+        if document["status"] != "awaiting_review":
             raise HTTPException(
-                409,
-                "document changed: "
-                f"you reviewed version {body.expected_version}, "
-                f"current is {d['version']}; reload and review",
+                status_code=409,
+                detail=(
+                    f"Document status is {document['status']}; "
+                    "not awaiting review"
+                ),
             )
 
-        r = conn.execute(
+        if document["version"] != body.expected_version:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Document changed. "
+                    f"Reviewed version: {body.expected_version}. "
+                    f"Current version: {document['version']}. "
+                    "Reload before reviewing."
+                ),
+            )
+
+        review_row = conn.execute(
             """
             INSERT INTO reviews (
                 tenant_id,
@@ -522,7 +749,7 @@ def review(
         ).fetchone()
 
         payload = {
-            "review_id": str(r["id"]),
+            "review_id": str(review_row["id"]),
             "user_id": user.id,
             "action": body.action,
             "expected_version": body.expected_version,
@@ -557,17 +784,25 @@ def review(
         )
 
     return {
-        "review_id": str(r["id"]),
+        "review_id": str(review_row["id"]),
         "status": "queued",
     }
 
 
+# --------------------------------------------------
+# Tenant statistics
+# --------------------------------------------------
+
 @app.get("/stats")
-def stats(user: User = Depends(current_user)):
+def stats(
+    user: User = Depends(current_user),
+):
     with tx(user.tenant_id) as conn:
         rows = conn.execute(
             """
-            SELECT status, count(*) AS n
+            SELECT
+                status,
+                count(*) AS n
             FROM documents
             GROUP BY status
             """
@@ -585,8 +820,8 @@ def stats(user: User = Depends(current_user)):
 
     return {
         "documents_by_status": {
-            r["status"]: r["n"]
-            for r in rows
+            row["status"]: row["n"]
+            for row in rows
         },
         "dead_letters": dead["n"],
     }
