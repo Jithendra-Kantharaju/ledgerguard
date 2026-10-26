@@ -11,3 +11,11 @@ ui/dist/
 .pytest_cache/
 .ruff_cache/
 .venv/
+
+# Terraform
+**/.terraform/
+**/*.tfstate
+**/*.tfstate.*
+**/terraform.tfvars
+**/*.tfplan
+**/.terraform.lock.hcl.backup
