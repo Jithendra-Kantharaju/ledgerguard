@@ -395,7 +395,6 @@ def test_review_pause_survives_worker_restart(
     """
 
     import psycopg
-
     from langgraph.checkpoint.postgres import (
         PostgresSaver,
     )

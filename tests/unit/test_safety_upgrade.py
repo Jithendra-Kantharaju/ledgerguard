@@ -11,7 +11,6 @@ from app.actions.guard import verify_readback
 from app.actions.qbo_client import QBOClient
 from app.settings import get_settings
 
-
 PAYLOAD = {
     "tenant_slug": "acme",
     "vendor_name": "Cedar Supplies",

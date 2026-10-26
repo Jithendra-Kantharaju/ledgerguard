@@ -41,7 +41,7 @@ class Settings(BaseSettings):
     ap_timeout_seconds: float = 10.0
     ap_api_token: str = "dev-ap-token"
 
-    
+
     # AP provider.
     ap_provider: str = "mock"
 
