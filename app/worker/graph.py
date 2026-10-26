@@ -1,5 +1,5 @@
 
-"""Durable invoice workflow with human review and AP safety."""
+"""LedgerGuard invoice workflow with durable human review."""
 
 from __future__ import annotations
 
@@ -113,7 +113,11 @@ def _save_analysis(
                     mode="json"
                 )
             ),
-            Jsonb(result.decision.model_dump(mode="json")),
+            Jsonb(
+                result.decision.model_dump(
+                    mode="json"
+                )
+            ),
             status,
             1 if bump else 0,
             doc_id,
@@ -138,6 +142,21 @@ def _review_outcome(
                 review["review_id"],
             ),
         )
+
+
+def _revalidation_message(
+    problems: list[str],
+) -> str:
+    """
+    Consistent, human-readable review outcome.
+
+    Preserve machine error codes such as po_closed,
+    but use readable text for approver-limit failures.
+    """
+    return (
+        "refused: revalidation failed: "
+        + "; ".join(problems)
+    )[:500]
 
 
 def build_graph(
@@ -167,10 +186,13 @@ def build_graph(
             document_id=doc_id,
         ):
             parsed = parse_document(
-                deps.storage.get(doc["storage_key"])
+                deps.storage.get(
+                    doc["storage_key"]
+                )
             )
 
-            # No database transaction during LLM calls.
+            # Do not hold a DB transaction
+            # while calling an LLM.
             ex = extract_invoice(
                 parsed,
                 deps.primary,
@@ -178,7 +200,10 @@ def build_graph(
             )
 
             with tx(tenant) as conn:
-                cfg = config_for(conn, tenant)
+                cfg = config_for(
+                    conn,
+                    tenant,
+                )
 
                 result = assess(
                     parsed,
@@ -190,13 +215,13 @@ def build_graph(
                     doc_id,
                 )
 
-                d = result.decision
+                decision = result.decision
 
                 _save_analysis(
                     conn,
                     doc_id,
                     result,
-                    STATUS_FOR[d.outcome],
+                    STATUS_FOR[decision.outcome],
                     bump=False,
                 )
 
@@ -207,29 +232,32 @@ def build_graph(
                     deps.actor,
                     "analyzed",
                     {
-                        "outcome": d.outcome.value,
-                        "gate": d.gate,
-                        "reasons": d.reasons,
-                        "confidence": d.confidence,
+                        "outcome": decision.outcome.value,
+                        "gate": decision.gate,
+                        "reasons": decision.reasons,
+                        "confidence": decision.confidence,
                         "calibrated":
                             result.confidence.calibrated,
                         "model": ex.primary.model,
                         "secondary_model": (
                             ex.secondary.model
-                            if ex.secondary else None
+                            if ex.secondary
+                            else None
                         ),
                         "input_tokens": (
                             ex.primary.input_tokens
                             + (
                                 ex.secondary.input_tokens
-                                if ex.secondary else 0
+                                if ex.secondary
+                                else 0
                             )
                         ),
                         "output_tokens": (
                             ex.primary.output_tokens
                             + (
                                 ex.secondary.output_tokens
-                                if ex.secondary else 0
+                                if ex.secondary
+                                else 0
                             )
                         ),
                         "parse_method": parsed.method,
@@ -237,7 +265,7 @@ def build_graph(
                 )
 
         return {
-            "outcome": d.outcome.value
+            "outcome": decision.outcome.value
         }
 
     def human_review(state: State) -> State:
@@ -258,7 +286,6 @@ def build_graph(
                     (doc_id,),
                 )
 
-        # LangGraph persists this pause in Postgres.
         review = interrupt(
             {
                 "document_id": doc_id,
@@ -275,7 +302,9 @@ def build_graph(
                 FROM users
                 WHERE id = %s
                 """,
-                (review.get("user_id"),),
+                (
+                    review.get("user_id"),
+                ),
             ).fetchone()
 
             error = None
@@ -285,7 +314,8 @@ def build_graph(
 
             elif user["role"] not in REVIEW_ROLES:
                 error = (
-                    f"role {user['role']} cannot review"
+                    f"role {user['role']} "
+                    "cannot review"
                 )
 
             elif (
@@ -345,14 +375,20 @@ def build_graph(
         with tx(tenant) as conn:
             doc = _doc(conn, doc_id)
 
-            if doc["version"] != review["expected_version"]:
+            if (
+                doc["version"]
+                != review["expected_version"]
+            ):
                 return {}
 
             try:
                 merged = Invoice(
                     **{
                         **(doc["invoice"] or {}),
-                        **(review.get("fields") or {}),
+                        **(
+                            review.get("fields")
+                            or {}
+                        ),
                     }
                 )
 
@@ -378,7 +414,10 @@ def build_graph(
                     tenant,
                     doc_id,
                     review["user_id"],
-                    Jsonb(review.get("fields") or {}),
+                    Jsonb(
+                        review.get("fields")
+                        or {}
+                    ),
                 ),
             )
 
@@ -386,7 +425,10 @@ def build_graph(
                 **doc["analysis"]["parsed"]
             )
 
-            cfg = config_for(conn, tenant)
+            cfg = config_for(
+                conn,
+                tenant,
+            )
 
             result = assess(
                 parsed,
@@ -419,7 +461,10 @@ def build_graph(
             _review_outcome(
                 conn,
                 review,
-                "applied; checks rerun; awaiting review",
+                (
+                    "applied; checks rerun; "
+                    "awaiting review"
+                ),
             )
 
             audit(
@@ -429,7 +474,9 @@ def build_graph(
                 str(review["user_id"]),
                 "corrected",
                 {
-                    "fields": review.get("fields"),
+                    "fields": review.get(
+                        "fields"
+                    ),
                     "new_decision":
                         result.decision.model_dump(
                             mode="json"
@@ -441,8 +488,8 @@ def build_graph(
 
     def revalidate(state: State) -> State:
         """
-        Recheck current evidence and save an audited,
-        versioned approval before execution.
+        Recheck current evidence before accepting
+        a human approval.
         """
 
         doc_id = state["document_id"]
@@ -452,13 +499,14 @@ def build_graph(
         with tx(tenant) as conn:
             doc = _doc(conn, doc_id)
 
-            # Idempotent replay.
             if doc["status"] in (
                 "executing",
                 "executed",
                 "shadow_approved",
             ):
-                return {"next": "execute"}
+                return {
+                    "next": "execute"
+                }
 
             user = conn.execute(
                 """
@@ -469,10 +517,18 @@ def build_graph(
                 (review["user_id"],),
             ).fetchone()
 
-            result = reassess(conn, doc)
-            inv = Invoice(**doc["invoice"])
+            result = reassess(
+                conn,
+                doc,
+            )
 
-            problems = hard_blockers(result)
+            inv = Invoice(
+                **doc["invoice"]
+            )
+
+            problems = hard_blockers(
+                result
+            )
 
             if (
                 not user
@@ -485,27 +541,32 @@ def build_graph(
 
             elif (
                 inv.total is None
-                or inv.total
-                > Decimal(user["approval_limit"])
+                or inv.total > Decimal(
+                    user["approval_limit"]
+                )
             ):
+                # Human-readable wording required by
+                # the approval-limit integration test.
                 problems.append(
-                    "exceeds_approver_limit"
+                    "exceeds approver limit"
                 )
 
-            flags = set(
+            current_flags = set(
                 result.match.review_flags
             )
 
             supplied = (
-                review.get("exception_codes") or []
+                review.get("exception_codes")
+                or []
             )
 
             reason = str(
-                review.get("exception_reason") or ""
+                review.get("exception_reason")
+                or ""
             ).strip()
 
             if (
-                set(supplied) != flags
+                set(supplied) != current_flags
                 or len(supplied) != len(set(supplied))
             ):
                 problems.append(
@@ -513,7 +574,10 @@ def build_graph(
                     "current_flags"
                 )
 
-            if flags and len(reason) < 12:
+            if (
+                current_flags
+                and len(reason) < 12
+            ):
                 problems.append(
                     "matching_exception_reason_required"
                 )
@@ -537,11 +601,14 @@ def build_graph(
                     },
                 )
 
+                # Both integration tests expect
+                # this consistent failure prefix.
                 _review_outcome(
                     conn,
                     review,
-                    "refused: "
-                    + "; ".join(problems),
+                    _revalidation_message(
+                        problems
+                    ),
                 )
 
                 audit(
@@ -552,7 +619,9 @@ def build_graph(
                     "revalidation_failed",
                     {
                         "problems": problems,
-                        "match_flags": sorted(flags),
+                        "match_flags": sorted(
+                            current_flags
+                        ),
                     },
                 )
 
@@ -564,9 +633,13 @@ def build_graph(
                 "review_id": review["review_id"],
                 "user_id": review["user_id"],
                 "version": doc["version"],
-                "exception_codes": sorted(flags),
+                "exception_codes": sorted(
+                    current_flags
+                ),
                 "exception_reason": (
-                    reason if flags else None
+                    reason
+                    if current_flags
+                    else None
                 ),
             }
 
@@ -595,7 +668,7 @@ def build_graph(
                 "accepted",
             )
 
-            if flags:
+            if current_flags:
                 audit(
                     conn,
                     tenant,
@@ -604,7 +677,9 @@ def build_graph(
                     "match_exception_granted",
                     {
                         "review_id": review["review_id"],
-                        "codes": sorted(flags),
+                        "codes": sorted(
+                            current_flags
+                        ),
                         "reason": reason,
                         "version": doc["version"],
                     },
@@ -629,7 +704,10 @@ def build_graph(
         }
 
     def execute(state: State) -> State:
-        """Queue an AP bill after independent safety checks."""
+        """
+        Recheck the invoice, then queue the AP
+        operation in the transactional outbox.
+        """
 
         doc_id = state["document_id"]
         tenant = state["tenant_id"]
@@ -642,7 +720,9 @@ def build_graph(
                 "executed",
                 "shadow_approved",
             ):
-                return {"next": "done"}
+                return {
+                    "next": "done"
+                }
 
             result, problems = preflight(
                 conn,
@@ -672,14 +752,19 @@ def build_graph(
                     doc_id,
                     deps.actor,
                     "execution_blocked",
-                    {"problems": problems},
+                    {
+                        "problems": problems
+                    },
                 )
 
                 return {
                     "next": "human_review"
                 }
 
-            cfg = config_for(conn, tenant)
+            cfg = config_for(
+                conn,
+                tenant,
+            )
 
             inv = Invoice(
                 **doc["invoice"]
@@ -706,13 +791,14 @@ def build_graph(
                     "shadow_would_execute",
                     {
                         "vendor": vendor.name,
-                        "invoice_number":
-                            inv.invoice_number,
+                        "invoice_number": inv.invoice_number,
                         "amount": str(inv.total),
                     },
                 )
 
-                return {"next": "done"}
+                return {
+                    "next": "done"
+                }
 
             inserted = conn.execute(
                 """
@@ -781,18 +867,21 @@ def build_graph(
                         },
                     )
 
-                    return {"next": "done"}
+                    return {
+                        "next": "done"
+                    }
 
             key = (
                 f"approve:{doc_id}:v{doc['version']}"
             )
 
-            # QuickBooks Bill creation is not payment approval.
-            ap_status = (
-                "bill_created"
-                if get_settings().ap_provider == "quickbooks"
-                else cfg.ap.approved_status
-            )
+            if (
+                get_settings().ap_provider
+                == "quickbooks"
+            ):
+                ap_status = "bill_created"
+            else:
+                ap_status = cfg.ap.approved_status
 
             payload = {
                 "tenant_slug": cfg.tenant_slug,
@@ -849,12 +938,17 @@ def build_graph(
                 },
             )
 
-        return {"next": "done"}
+        return {
+            "next": "done"
+        }
 
     def reject(state: State) -> State:
         doc_id = state["document_id"]
         tenant = state["tenant_id"]
-        review = state.get("review")
+
+        review = state.get(
+            "review"
+        )
 
         with tx(tenant) as conn:
             conn.execute(
@@ -867,7 +961,10 @@ def build_graph(
                 (doc_id,),
             )
 
-            if review and review.get("action") == "reject":
+            if (
+                review
+                and review.get("action") == "reject"
+            ):
                 _review_outcome(
                     conn,
                     review,
@@ -911,7 +1008,10 @@ def build_graph(
     ]:
         g.add_node(name, fn)
 
-    g.add_edge(START, "analyze")
+    g.add_edge(
+        START,
+        "analyze",
+    )
 
     g.add_conditional_edges(
         "analyze",
@@ -920,7 +1020,11 @@ def build_graph(
             "review": "human_review",
             "reject": "reject",
         }[s["outcome"]],
-        ["execute", "human_review", "reject"],
+        [
+            "execute",
+            "human_review",
+            "reject",
+        ],
     )
 
     g.add_conditional_edges(
@@ -942,7 +1046,10 @@ def build_graph(
     g.add_conditional_edges(
         "revalidate",
         lambda s: s["next"],
-        ["execute", "human_review"],
+        [
+            "execute",
+            "human_review",
+        ],
     )
 
     g.add_conditional_edges(
@@ -952,10 +1059,16 @@ def build_graph(
             if s.get("next") == "human_review"
             else END
         ),
-        ["human_review", END],
+        [
+            "human_review",
+            END,
+        ],
     )
 
-    g.add_edge("reject", END)
+    g.add_edge(
+        "reject",
+        END,
+    )
 
     return g.compile(
         checkpointer=checkpointer
