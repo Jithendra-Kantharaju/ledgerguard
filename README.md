@@ -194,6 +194,32 @@ docker compose up --build
 .venv/bin/python -m scripts.upload_demo     # from the host, against the containers
 ```
 
+
+## Application Demo
+
+### Dashboard
+![LedgerGuard Dashboard](docs/images/ledgerguard-dashboard.png)
+
+### Human-in-the-Loop Review
+![Invoice Review](docs/images/ledgerguard-review.png)
+
+### Verified AP Execution
+![AP Execution](docs/images/ledgerguard-execution.png)
+
+## Local Verification Results
+
+- 70 automated tests passed
+- 19 synthetic invoices processed
+- 5 mock AP bills successfully created
+- 8 invoices rejected
+- 6 invoices routed for human review
+- 0 dead-lettered actions
+
+These results use synthetic invoices and a mock AP API.
+Real LLM extraction and QuickBooks sandbox validation
+are separate verification stages.
+
+
 Before deploying anywhere real:
 
 1. `python -m scripts.seed --random-keys` (or create users yourself) — the `dev-*` keys are public.
@@ -222,3 +248,4 @@ Before deploying anywhere real:
 - **No real AP connector.** The mock behaves like real AP APIs in the ways that matter (idempotency
   keys, lost responses, read-back), but QuickBooks / NetSuite / SAP adapters are not included.
 - **No SSO.** API keys per user; swap `current_user` in `app/api/main.py` for OIDC in a real deployment.
+
