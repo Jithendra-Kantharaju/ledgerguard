@@ -1,0 +1,143 @@
+
+name: Deploy LedgerGuard to AWS
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: ledgerguard-aws-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    environment: aws-dev
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: AWS identity
+        run: aws sts get-caller-identity
+
+      - name: Login to Amazon ECR
+        id: login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Docker image
+        env:
+          REGISTRY: ${{ steps.login.outputs.registry }}
+          REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+        run: |
+          set -euo pipefail
+
+          IMAGE="${REGISTRY}/${REPOSITORY}:${GITHUB_SHA}"
+
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+
+          echo "IMAGE_URI=$IMAGE" >> "$GITHUB_ENV"
+
+      - name: Deploy ECS API and worker
+        env:
+          ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+        run: |
+          set -euo pipefail
+
+          for SERVICE in api worker; do
+            FAMILY="${ECS_CLUSTER}-${SERVICE}"
+            SERVICE_NAME="${ECS_CLUSTER}-${SERVICE}"
+
+            aws ecs describe-task-definition \
+              --task-definition "$FAMILY" \
+              --query taskDefinition \
+              --output json > task.json
+
+            jq --arg IMAGE "$IMAGE_URI" \
+               --arg NAME "$SERVICE" \
+              '
+              {
+                family,
+                taskRoleArn,
+                executionRoleArn,
+                networkMode,
+                containerDefinitions,
+                volumes,
+                requiresCompatibilities,
+                cpu,
+                memory,
+                runtimePlatform
+              }
+              | with_entries(select(.value != null))
+              | .containerDefinitions |= map(
+                  if .name == $NAME
+                  then .image = $IMAGE
+                  else .
+                  end
+                )
+              ' task.json > task-new.json
+
+            TASK_ARN=$(aws ecs register-task-definition \
+              --cli-input-json file://task-new.json \
+              --query 'taskDefinition.taskDefinitionArn' \
+              --output text)
+
+            aws ecs update-service \
+              --cluster "$ECS_CLUSTER" \
+              --service "$SERVICE_NAME" \
+              --task-definition "$TASK_ARN"
+
+            aws ecs wait services-stable \
+              --cluster "$ECS_CLUSTER" \
+              --services "$SERVICE_NAME"
+          done
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Build React frontend
+        working-directory: ui
+        env:
+          VITE_API_URL: ${{ vars.VITE_API_URL }}
+          VITE_COGNITO_DOMAIN: ${{ vars.VITE_COGNITO_DOMAIN }}
+          VITE_COGNITO_CLIENT_ID: ${{ vars.VITE_COGNITO_CLIENT_ID }}
+          VITE_REDIRECT_URI: ${{ vars.VITE_REDIRECT_URI }}
+        run: |
+          npm ci
+          npm run build
+
+      - name: Upload frontend to S3
+        env:
+          FRONTEND_BUCKET: ${{ vars.FRONTEND_BUCKET }}
+        run: |
+          aws s3 sync ui/dist/ \
+            "s3://${FRONTEND_BUCKET}/" \
+            --delete
+
+      - name: Invalidate CloudFront cache
+        env:
+          DISTRIBUTION_ID: ${{ vars.CLOUDFRONT_DISTRIBUTION_ID }}
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "$DISTRIBUTION_ID" \
+            --paths "/*"
+
+      - name: Deployment completed
+        run: |
+          echo "LedgerGuard deployment completed"
+          echo "Image: $IMAGE_URI"
