@@ -1,23 +1,40 @@
 
-# LedgerGuard local development stack.
-# PostgreSQL, MinIO, API, worker, mock AP and React UI.
+# LedgerGuard local end-to-end development stack
+#
+# Services:
+# - PostgreSQL + pgvector
+# - Database migrations and demo data
+# - Mock AP service
+# - FastAPI backend
+# - LangGraph worker
+# - React dashboard
+#
+# Document storage:
+# Shared Docker volume using app.storage.LocalStorage
+#
+# No MinIO dependency.
+#
+# This is a LOCAL DEVELOPMENT configuration.
+# Do not expose it directly to the public internet.
 
 x-app-env: &app-env
+  # Database
   DATABASE_URL: postgresql://ap_app:ap_app@postgres:5432/apagent
   ADMIN_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/apagent
 
-  STORAGE_BACKEND: s3
-  S3_ENDPOINT_URL: http://minio:9000
-  S3_ACCESS_KEY: minioadmin
-  S3_SECRET_KEY: minioadmin
-  S3_BUCKET: ap-documents
+  # Shared persistent document storage
+  STORAGE_BACKEND: local
+  STORAGE_DIR: /app/.storage
 
+  # Mock AP system
   AP_API_URL: http://mock-ap:8001
   AP_API_TOKEN: dev-ap-token
 
+  # AP provider selection
   AP_PROVIDER: ${AP_PROVIDER:-mock}
   SHADOW_MODE: ${SHADOW_MODE:-false}
 
+  # QuickBooks sandbox configuration
   QBO_COMPANY_ID: ${QBO_COMPANY_ID:-}
   QBO_ACCESS_TOKEN: ${QBO_ACCESS_TOKEN:-}
   QBO_TENANT_SLUG: ${QBO_TENANT_SLUG:-acme}
@@ -25,33 +42,43 @@ x-app-env: &app-env
   QBO_VENDOR_NAME: ${QBO_VENDOR_NAME:-}
   QBO_EXPENSE_ACCOUNT_ID: ${QBO_EXPENSE_ACCOUNT_ID:-}
 
+  # Invoice parsing and OCR
   OCR_BACKEND: tesseract
 
+  # AI extraction
   EXTRACTOR: ${EXTRACTOR:-rules}
   SECONDARY_EXTRACTOR: ${SECONDARY_EXTRACTOR:-rules_alt}
-
-  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-  ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-haiku-5-5}
 
   OPENAI_API_KEY: ${OPENAI_API_KEY:-}
   OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
 
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-haiku-5-5}
+
+  # Observability
   OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
   OTEL_EXPORTER_OTLP_HEADERS: ${OTEL_EXPORTER_OTLP_HEADERS:-}
 
+  # Frontend CORS
   CORS_ORIGINS: http://localhost:5173
 
 services:
 
+  # ---------------------------------------
+  # PostgreSQL and pgvector
+  # ---------------------------------------
   postgres:
     image: pgvector/pgvector:pg16
 
+    restart: unless-stopped
+
     environment:
+      POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: apagent
 
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
 
     volumes:
       - pgdata:/var/lib/postgresql/data
@@ -60,35 +87,27 @@ services:
       test:
         - CMD-SHELL
         - pg_isready -U postgres -d apagent
-      interval: 2s
+      interval: 3s
+      timeout: 5s
       retries: 30
 
-  minio:
-    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
-
-    command: server /data --console-address ":9001"
-
-    environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
-
-    ports:
-      - "9000:9000"
-      - "9001:9001"
-
-    volumes:
-      - miniodata:/data
-
+  # ---------------------------------------
+  # Database migrations and seed data
+  # ---------------------------------------
   migrate:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
 
     user: "0:0"
 
     environment: *app-env
 
     command: >
-      sh -c "python -m scripts.init_db &&
-             python -m scripts.seed"
+      sh -c "
+      python -m scripts.init_db &&
+      python -m scripts.seed
+      "
 
     volumes:
       - ./data/generated:/app/data/generated
@@ -97,8 +116,17 @@ services:
       postgres:
         condition: service_healthy
 
+    restart: "no"
+
+  # ---------------------------------------
+  # Mock accounting service
+  # ---------------------------------------
   mock-ap:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    restart: unless-stopped
 
     environment:
       MOCK_AP_TOKEN: dev-ap-token
@@ -109,56 +137,95 @@ services:
       --port 8001
 
     ports:
-      - "8001:8001"
+      - "127.0.0.1:8001:8001"
 
+  # ---------------------------------------
+  # FastAPI backend
+  # ---------------------------------------
   api:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    restart: unless-stopped
 
     environment: *app-env
+
+    command: >
+      uvicorn app.api.main:app
+      --host 0.0.0.0
+      --port 8000
 
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
+
+    volumes:
+      # Same volume as the worker
+      - ledgerguard_docs:/app/.storage
 
     depends_on:
       migrate:
         condition: service_completed_successfully
-      minio:
-        condition: service_started
 
+  # ---------------------------------------
+  # LangGraph and outbox worker
+  # ---------------------------------------
   worker:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    restart: unless-stopped
 
     environment: *app-env
 
-    command: python -m app.worker.main
+    command: >
+      python -m app.worker.main
+
+    volumes:
+      # Shared with the FastAPI container
+      - ledgerguard_docs:/app/.storage
 
     depends_on:
       migrate:
         condition: service_completed_successfully
-      minio:
-        condition: service_started
+
       mock-ap:
         condition: service_started
 
+  # ---------------------------------------
+  # React frontend
+  # ---------------------------------------
   ui:
     image: node:22-alpine
+
+    restart: unless-stopped
 
     working_dir: /ui
 
     command: >
-      sh -c "npm install --no-audit --no-fund &&
-             npm run dev -- --host 0.0.0.0"
+      sh -c "
+      npm ci --no-audit --no-fund &&
+      npm run dev -- --host 0.0.0.0
+      "
 
     environment:
       VITE_API_URL: http://localhost:8000
 
     ports:
-      - "5173:5173"
+      - "127.0.0.1:5173:5173"
 
     volumes:
       - ./ui:/ui
       - /ui/node_modules
 
+    depends_on:
+      api:
+        condition: service_started
+
+# ---------------------------------------
+# Persistent volumes
+# ---------------------------------------
 volumes:
   pgdata:
-  miniodata:
+  ledgerguard_docs:
