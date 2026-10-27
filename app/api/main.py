@@ -36,7 +36,6 @@ from app.storage import get_storage
 from app.tracing import configure_tracing
 from app.worker import queue
 
-
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 
 
@@ -240,13 +239,13 @@ def healthz():
 @app.get("/readyz")
 def readyz():
     try:
-        with pool().connection() as conn:
+        with pool.connection() as conn:
             conn.execute("SELECT 1")
-    except Exception:
+    except Exception as exc:
         raise HTTPException(
             status_code=503,
             detail="Database unavailable",
-        )
+        ) from exc
 
     return {
         "ok": True

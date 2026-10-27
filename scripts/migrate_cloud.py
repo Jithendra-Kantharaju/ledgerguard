@@ -1,9 +1,9 @@
 
 """Add Cognito identity mapping to the existing schema."""
 
-from app.settings import get_settings
-
 import psycopg
+
+from app.settings import get_settings
 
 
 def main() -> None:
