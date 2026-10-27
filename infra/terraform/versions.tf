@@ -1,6 +1,13 @@
-
 terraform {
-  required_version = ">= 1.9.0"
+  required_version = ">= 1.10.0"
+
+  backend "s3" {
+    bucket       = "ledgerguard-jithendra"
+    key          = "ledgerguard/dev/terraform.tfstate"
+    region       = "us-east-1"
+    encrypt      = true
+    use_lockfile = true
+  }
 
   required_providers {
     aws = {
@@ -15,6 +22,7 @@ terraform {
   }
 }
 
+# Application infrastructure region comes from terraform.tfvars.
 provider "aws" {
   region = var.aws_region
 
