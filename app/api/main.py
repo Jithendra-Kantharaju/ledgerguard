@@ -239,7 +239,7 @@ def healthz():
 @app.get("/readyz")
 def readyz():
     try:
-        with pool.connection() as conn:
+        with pool().connection() as conn:
             conn.execute("SELECT 1")
     except Exception as exc:
         raise HTTPException(
@@ -247,9 +247,7 @@ def readyz():
             detail="Database unavailable",
         ) from exc
 
-    return {
-        "ok": True
-    }
+    return {"ok": True}
 
 
 # --------------------------------------------------
