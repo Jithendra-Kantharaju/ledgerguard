@@ -1,5 +1,12 @@
 
-# ---------------- ECR ----------------
+# ============================================================
+# LedgerGuard AWS Services
+# ECR, ECS Fargate, IAM, CloudWatch and GitHub Actions OIDC
+# ============================================================
+
+# ------------------------------------------------------------
+# ECR repository
+# ------------------------------------------------------------
 
 resource "aws_ecr_repository" "app" {
   name                 = local.name
@@ -14,7 +21,9 @@ resource "aws_ecr_repository" "app" {
   }
 }
 
-# ---------------- ECS CLUSTER ----------------
+# ------------------------------------------------------------
+# ECS cluster
+# ------------------------------------------------------------
 
 resource "aws_ecs_cluster" "main" {
   name = local.name
@@ -24,6 +33,10 @@ resource "aws_ecs_cluster" "main" {
     value = "enabled"
   }
 }
+
+# ------------------------------------------------------------
+# CloudWatch log groups
+# ------------------------------------------------------------
 
 resource "aws_cloudwatch_log_group" "api" {
   name              = "/ecs/${local.name}/api"
@@ -40,7 +53,10 @@ resource "aws_cloudwatch_log_group" "migrate" {
   retention_in_days = 14
 }
 
-# ---------------- ECS IAM ROLES ----------------
+# ------------------------------------------------------------
+# ECS execution role
+# Used for ECR pull, CloudWatch logs and secret injection.
+# ------------------------------------------------------------
 
 data "aws_iam_policy_document" "ecs_assume" {
   statement {
@@ -79,21 +95,28 @@ resource "aws_iam_role_policy" "execution_secrets" {
   policy = jsonencode({
     Version = "2012-10-17"
 
-    Statement = [{
-      Effect = "Allow"
+    Statement = [
+      {
+        Effect = "Allow"
 
-      Action = [
-        "secretsmanager:GetSecretValue"
-      ]
+        Action = [
+          "secretsmanager:GetSecretValue"
+        ]
 
-      Resource = [
-        aws_secretsmanager_secret.database.arn,
-        aws_secretsmanager_secret.openai.arn,
-        aws_secretsmanager_secret.quickbooks.arn
-      ]
-    }]
+        Resource = [
+          aws_secretsmanager_secret.database.arn,
+          aws_secretsmanager_secret.openai.arn,
+          aws_secretsmanager_secret.quickbooks.arn
+        ]
+      }
+    ]
   })
 }
+
+# ------------------------------------------------------------
+# ECS application task role
+# Used for private S3 invoice storage.
+# ------------------------------------------------------------
 
 resource "aws_iam_role" "application" {
   name = "${local.name}-app-task"
@@ -110,22 +133,26 @@ resource "aws_iam_role_policy" "s3_documents" {
   policy = jsonencode({
     Version = "2012-10-17"
 
-    Statement = [{
-      Effect = "Allow"
+    Statement = [
+      {
+        Effect = "Allow"
 
-      Action = [
-        "s3:GetObject",
-        "s3:PutObject"
-      ]
+        Action = [
+          "s3:GetObject",
+          "s3:PutObject"
+        ]
 
-      Resource = [
-        "${aws_s3_bucket.invoices.arn}/*"
-      ]
-    }]
+        Resource = [
+          "${aws_s3_bucket.invoices.arn}/*"
+        ]
+      }
+    ]
   })
 }
 
-# ---------------- CONTAINER CONFIG ----------------
+# ------------------------------------------------------------
+# Common application configuration
+# ------------------------------------------------------------
 
 locals {
   image = (
@@ -198,17 +225,23 @@ locals {
   openai_secret = {
     name = "OPENAI_API_KEY"
 
-    valueFrom = aws_secretsmanager_secret.openai.arn
+    valueFrom = (
+      aws_secretsmanager_secret.openai.arn
+    )
   }
 
   quickbooks_secret = {
     name = "QBO_ACCESS_TOKEN"
 
-    valueFrom = aws_secretsmanager_secret.quickbooks.arn
+    valueFrom = (
+      aws_secretsmanager_secret.quickbooks.arn
+    )
   }
 }
 
-# ---------------- API TASK ----------------
+# ------------------------------------------------------------
+# FastAPI task definition
+# ------------------------------------------------------------
 
 resource "aws_ecs_task_definition" "api" {
   family                   = "${local.name}-api"
@@ -230,22 +263,28 @@ resource "aws_ecs_task_definition" "api" {
       command = [
         "uvicorn",
         "app.api.main:app",
-        "--host", "0.0.0.0",
-        "--port", "8000"
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000"
       ]
 
-      portMappings = [{
-        containerPort = 8000
-        hostPort      = 8000
-        protocol      = "tcp"
-      }]
+      portMappings = [
+        {
+          containerPort = 8000
+          hostPort      = 8000
+          protocol      = "tcp"
+        }
+      ]
 
       environment = concat(
         local.common_environment,
-        [{
-          name  = "EXTRACTOR"
-          value = "openai"
-        }]
+        [
+          {
+            name  = "EXTRACTOR"
+            value = "openai"
+          }
+        ]
       )
 
       secrets = [
@@ -256,8 +295,12 @@ resource "aws_ecs_task_definition" "api" {
         logDriver = "awslogs"
 
         options = {
-          awslogs-group         = aws_cloudwatch_log_group.api.name
-          awslogs-region        = var.aws_region
+          awslogs-group = (
+            aws_cloudwatch_log_group.api.name
+          )
+
+          awslogs-region = var.aws_region
+
           awslogs-stream-prefix = "api"
         }
       }
@@ -265,7 +308,9 @@ resource "aws_ecs_task_definition" "api" {
   ])
 }
 
-# ---------------- WORKER TASK ----------------
+# ------------------------------------------------------------
+# LangGraph worker task definition
+# ------------------------------------------------------------
 
 resource "aws_ecs_task_definition" "worker" {
   family                   = "${local.name}-worker"
@@ -322,8 +367,12 @@ resource "aws_ecs_task_definition" "worker" {
         logDriver = "awslogs"
 
         options = {
-          awslogs-group         = aws_cloudwatch_log_group.worker.name
-          awslogs-region        = var.aws_region
+          awslogs-group = (
+            aws_cloudwatch_log_group.worker.name
+          )
+
+          awslogs-region = var.aws_region
+
           awslogs-stream-prefix = "worker"
         }
       }
@@ -331,7 +380,10 @@ resource "aws_ecs_task_definition" "worker" {
   ])
 }
 
-# ---------------- MIGRATION TASK ----------------
+# ------------------------------------------------------------
+# Database migration task definition
+# One-off privileged migration task, not a persistent service.
+# ------------------------------------------------------------
 
 resource "aws_ecs_task_definition" "migrate" {
   family                   = "${local.name}-migrate"
@@ -343,7 +395,6 @@ resource "aws_ecs_task_definition" "migrate" {
 
   execution_role_arn = aws_iam_role.execution.arn
 
-  # No S3 access is needed by migration.
   container_definitions = jsonencode([
     {
       name      = "migrate"
@@ -377,8 +428,12 @@ resource "aws_ecs_task_definition" "migrate" {
         logDriver = "awslogs"
 
         options = {
-          awslogs-group         = aws_cloudwatch_log_group.migrate.name
-          awslogs-region        = var.aws_region
+          awslogs-group = (
+            aws_cloudwatch_log_group.migrate.name
+          )
+
+          awslogs-region = var.aws_region
+
           awslogs-stream-prefix = "migrate"
         }
       }
@@ -386,7 +441,9 @@ resource "aws_ecs_task_definition" "migrate" {
   ])
 }
 
-# ---------------- ECS SERVICES ----------------
+# ------------------------------------------------------------
+# ECS API service
+# ------------------------------------------------------------
 
 resource "aws_ecs_service" "api" {
   name            = "${local.name}-api"
@@ -421,13 +478,19 @@ resource "aws_ecs_service" "api" {
   }
 
   lifecycle {
-    ignore_changes = [task_definition]
+    ignore_changes = [
+      task_definition
+    ]
   }
 
   depends_on = [
     aws_lb_listener.https
   ]
 }
+
+# ------------------------------------------------------------
+# ECS worker service
+# ------------------------------------------------------------
 
 resource "aws_ecs_service" "worker" {
   name            = "${local.name}-worker"
@@ -454,11 +517,15 @@ resource "aws_ecs_service" "worker" {
   }
 
   lifecycle {
-    ignore_changes = [task_definition]
+    ignore_changes = [
+      task_definition
+    ]
   }
 }
 
-# ---------------- MONITORING ----------------
+# ------------------------------------------------------------
+# SNS alert topic
+# ------------------------------------------------------------
 
 resource "aws_sns_topic" "alerts" {
   name = "${local.name}-alerts"
@@ -469,6 +536,10 @@ resource "aws_sns_topic_subscription" "email" {
   protocol  = "email"
   endpoint  = var.notification_email
 }
+
+# ------------------------------------------------------------
+# CloudWatch alarm: API target 5xx
+# ------------------------------------------------------------
 
 resource "aws_cloudwatch_metric_alarm" "alb_errors" {
   alarm_name = "${local.name}-alb-5xx"
@@ -493,7 +564,12 @@ resource "aws_cloudwatch_metric_alarm" "alb_errors" {
   ]
 }
 
-# ---------------- GITHUB OIDC ----------------
+# ------------------------------------------------------------
+# GitHub Actions OIDC provider
+#
+# The GitHub repository was created after July 15, 2026.
+# Its default OIDC subject uses immutable identity IDs.
+# ------------------------------------------------------------
 
 resource "aws_iam_openid_connect_provider" "github" {
   url = "https://token.actions.githubusercontent.com"
@@ -503,35 +579,60 @@ resource "aws_iam_openid_connect_provider" "github" {
   ]
 }
 
+# ------------------------------------------------------------
+# GitHub Actions deployment IAM role
+#
+# Authorized repository:
+# Jithendra-Kantharaju/ledgerguard
+#
+# Immutable owner ID: 193730490
+# Immutable repo ID: 1426526327
+#
+# Protected environment: aws-dev
+#
+# IMPORTANT:
+# Protect the aws-dev GitHub environment and restrict it
+# to the ledgerguard-production-hardening branch.
+# ------------------------------------------------------------
+
 resource "aws_iam_role" "github_deploy" {
   name = "${local.name}-github-deploy"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
 
-    Statement = [{
-      Effect = "Allow"
+    Statement = [
+      {
+        Effect = "Allow"
 
-      Principal = {
-        Federated = aws_iam_openid_connect_provider.github.arn
-      }
-
-      Action = "sts:AssumeRoleWithWebIdentity"
-
-      Condition = {
-        StringEquals = {
-          "token.actions.githubusercontent.com:aud" = (
-            "sts.amazonaws.com"
-          )
-
-          "token.actions.githubusercontent.com:sub" = (
-            "repo:${var.github_repository}:ref:refs/heads/${var.github_branch}"
+        Principal = {
+          Federated = (
+            aws_iam_openid_connect_provider.github.arn
           )
         }
+
+        Action = "sts:AssumeRoleWithWebIdentity"
+
+        Condition = {
+          StringEquals = {
+            "token.actions.githubusercontent.com:aud" = (
+              "sts.amazonaws.com"
+            )
+
+            "token.actions.githubusercontent.com:sub" = (
+              "repo:Jithendra-Kantharaju@193730490/ledgerguard@1426526327:environment:aws-dev"
+            )
+          }
+        }
       }
-    }]
+    ]
   })
 }
+
+# ------------------------------------------------------------
+# GitHub Actions deployment IAM permissions
+# ECR push, ECS deployment, frontend S3 sync and CloudFront.
+# ------------------------------------------------------------
 
 resource "aws_iam_role_policy" "github_deploy" {
   name = "deploy-ecs-and-frontend"
@@ -541,6 +642,7 @@ resource "aws_iam_role_policy" "github_deploy" {
     Version = "2012-10-17"
 
     Statement = [
+      # ECR authentication
       {
         Effect = "Allow"
 
@@ -550,6 +652,8 @@ resource "aws_iam_role_policy" "github_deploy" {
 
         Resource = "*"
       },
+
+      # Push and inspect application images
       {
         Effect = "Allow"
 
@@ -564,6 +668,8 @@ resource "aws_iam_role_policy" "github_deploy" {
 
         Resource = aws_ecr_repository.app.arn
       },
+
+      # Register updated ECS task definitions
       {
         Effect = "Allow"
 
@@ -573,6 +679,8 @@ resource "aws_iam_role_policy" "github_deploy" {
 
         Resource = "*"
       },
+
+      # Read task definitions
       {
         Effect = "Allow"
 
@@ -582,6 +690,8 @@ resource "aws_iam_role_policy" "github_deploy" {
 
         Resource = "*"
       },
+
+      # Deploy application services
       {
         Effect = "Allow"
 
@@ -595,6 +705,8 @@ resource "aws_iam_role_policy" "github_deploy" {
           aws_ecs_service.worker.id
         ]
       },
+
+      # Permit ECS to use only application roles
       {
         Effect = "Allow"
 
@@ -607,6 +719,8 @@ resource "aws_iam_role_policy" "github_deploy" {
           aws_iam_role.application.arn
         ]
       },
+
+      # List frontend deployment bucket
       {
         Effect = "Allow"
 
@@ -614,8 +728,12 @@ resource "aws_iam_role_policy" "github_deploy" {
           "s3:ListBucket"
         ]
 
-        Resource = aws_s3_bucket.frontend.arn
+        Resource = (
+          aws_s3_bucket.frontend.arn
+        )
       },
+
+      # Upload and delete React build artifacts
       {
         Effect = "Allow"
 
@@ -628,6 +746,8 @@ resource "aws_iam_role_policy" "github_deploy" {
           "${aws_s3_bucket.frontend.arn}/*"
         )
       },
+
+      # Invalidate frontend cache after deployment
       {
         Effect = "Allow"
 

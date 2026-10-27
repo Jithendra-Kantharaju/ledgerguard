@@ -178,11 +178,11 @@ resource "aws_db_instance" "main" {
   engine         = "postgres"
   engine_version = "16"
 
-  instance_class    = var.db_instance_class
-  allocated_storage = 20
+  instance_class        = var.db_instance_class
+  allocated_storage     = 20
   max_allocated_storage = 100
-  storage_type      = "gp3"
-  storage_encrypted = true
+  storage_type          = "gp3"
+  storage_encrypted     = true
 
   db_name  = "apagent"
   username = "postgres"
@@ -238,12 +238,12 @@ resource "aws_secretsmanager_secret_version" "database" {
 # Create secret containers only.
 # Populate their values using AWS CLI before enabling ECS services.
 resource "aws_secretsmanager_secret" "openai" {
-  name = "${local.name}/openai"
+  name                    = "${local.name}/openai"
   recovery_window_in_days = 7
 }
 
 resource "aws_secretsmanager_secret" "quickbooks" {
-  name = "${local.name}/quickbooks"
+  name                    = "${local.name}/quickbooks"
   recovery_window_in_days = 7
 }
 
@@ -441,7 +441,7 @@ resource "aws_cloudfront_distribution" "frontend" {
       aws_acm_certificate_validation.frontend.certificate_arn
     )
 
-    ssl_support_method = "sni-only"
+    ssl_support_method       = "sni-only"
     minimum_protocol_version = "TLSv1.2_2021"
   }
 }
@@ -522,8 +522,8 @@ resource "aws_cognito_user_pool_client" "web" {
   generate_secret = false
 
   allowed_oauth_flows_user_pool_client = true
-  allowed_oauth_flows = ["code"]
-  allowed_oauth_scopes = ["openid", "email", "profile"]
+  allowed_oauth_flows                  = ["code"]
+  allowed_oauth_scopes                 = ["openid", "email", "profile"]
 
   supported_identity_providers = ["COGNITO"]
 
@@ -607,8 +607,8 @@ resource "aws_route53_record" "api" {
   type    = "A"
 
   alias {
-    name = aws_lb.api.dns_name
-    zone_id = aws_lb.api.zone_id
+    name                   = aws_lb.api.dns_name
+    zone_id                = aws_lb.api.zone_id
     evaluate_target_health = true
   }
 }
