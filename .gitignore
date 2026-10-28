@@ -19,3 +19,7 @@ ui/dist/
 **/terraform.tfvars
 **/*.tfplan
 **/.terraform.lock.hcl.backup
+
+# Temporary ECS task-definition files
+/task.json
+/task-new.json
