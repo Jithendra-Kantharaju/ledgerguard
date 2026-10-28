@@ -26,6 +26,7 @@ dependencies = [
     "opentelemetry-exporter-otlp-proto-http>=1.25",
     "anthropic>=0.60",
     "openai>=1.40",
+    "PyJWT[crypto]>=2.9,<3.0",
 ]
 
 [project.optional-dependencies]

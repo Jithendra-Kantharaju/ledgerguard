@@ -1,0 +1,36 @@
+
+project     = "ledgerguard"
+environment = "dev"
+
+aws_region = "us-east-2"
+
+domain_name    = "example.com"
+hosted_zone_id = "Z_REPLACE_WITH_YOUR_ZONE_ID"
+
+github_repository = "YOUR_GITHUB_USERNAME/ledgerguard"
+
+github_branch = "ledgerguard-production-hardening"
+
+cognito_domain_prefix = "ledgerguard-unique-example"
+
+notification_email = "your-email@example.com"
+
+db_instance_class = "db.t4g.micro"
+
+# First deployment: infrastructure only.
+enable_services = false
+
+# Never dispatch external AP actions during initial rollout.
+shadow_mode = true
+
+ap_provider = "quickbooks"
+
+# Configure after testing QuickBooks.
+qbo_tenant_slug        = "acme"
+qbo_vendor_id          = ""
+qbo_vendor_name        = ""
+qbo_expense_account_id = ""
+
+# Development environment.
+multi_az           = false
+deletion_protection = false

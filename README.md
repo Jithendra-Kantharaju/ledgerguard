@@ -1,224 +1,256 @@
-# AP Invoice Agent
+# LedgerGuard — AI-Powered Accounts Payable Automation
 
-An accounts-payable agent that reads supplier invoices, checks them against purchase orders
-and goods receipts (three-way match), decides **approve / review / reject** with business
-rules first and calibrated confidence second, pauses durably for a person when it should,
-and sends approved invoices to the AP system **exactly once**, with read-back verification
-and a full audit trail.
+**An end-to-end invoice operations system combining document AI, deterministic financial controls, human-in-the-loop approval, and cloud-native delivery.**
 
-![architecture](docs/architecture.png)
+`Python` · `FastAPI` · `LangGraph` · `OpenAI` · `PostgreSQL / pgvector` · `React` · `AWS ECS Fargate` · `Terraform` · `GitHub Actions`
 
-## What is in here
+> **Deployment status:** LedgerGuard was deployed and demonstrated on AWS using Cognito, ECS Fargate, RDS PostgreSQL, private S3, CloudFront, and GitHub Actions. The AWS demonstration stack was subsequently **decommissioned to avoid ongoing costs**. The public app/API URLs are **not live demos**. The source code, synthetic datasets, screenshots, and deployment evidence remain available here.
+>
+> **Data and safety:** All showcased invoices and business entities are synthetic. The recorded AWS demo used **shadow mode**: it recorded would-be accounting actions without creating QuickBooks Bills.
 
-| Area | Where | Notes |
-|---|---|---|
-| Parse | `app/pipeline/parse.py` | PyMuPDF text layer; Tesseract OCR for scans; Docling optional |
-| Extract | `app/pipeline/extract.py` | Two independent passes. Offline rule extractors (no key), or Claude / OpenAI with strict JSON-schema output. Document text is treated as untrusted data |
-| Validate, retrieve, match | `app/pipeline/validate.py`, `retrieve.py`, `match.py` | Arithmetic, currency, dates, duplicates, PO / vendor / receipt match with per-customer tolerances. A failure on an unverified reading (scan, or passes disagree) becomes *review*, not *reject* |
-| Confidence + router | `app/pipeline/confidence.py`, `router.py` | Gates in order: hard rule → reject; amount/flags → review; calibrated confidence → review; else approve |
-| Workflow | `app/worker/graph.py` | LangGraph with a Postgres checkpointer; `interrupt()` for human review; revalidation on approval; corrections rerun checks and never auto-execute |
-| Queue | `app/worker/queue.py` | Postgres `FOR UPDATE SKIP LOCKED`, leases, retries with backoff, sweeper |
-| Execution | `app/actions/dispatcher.py` | Transactional outbox, idempotency key `approve:<doc>:v<version>`, status query on timeout, read-back, dead-letter |
-| API | `app/api/main.py` | FastAPI, API keys per user, roles (uploader / reviewer / approver / admin), approval limits |
-| Data isolation | `app/db/schema.sql` | Row-level security on every tenant table; app connects as a non-owner role; audit log is insert-only |
-| Mock AP system | `app/mock_ap/server.py` | Idempotent, with fault injection (outage, lost response after commit, wrong read-back) |
-| Review UI | `ui/` | React + Vite: queue, PDF, fields (disagreements highlighted), reasons, approve / correct / reject, audit trail |
-| Evaluation | `eval/`, `data/generate.py` | Synthetic data with known answers, frozen test set (checksums), baselines, calibration + threshold sweep |
-| Customer config | `app/config/*.yaml` | Tolerances, limits, thresholds, AP status names. A new customer is a new YAML file |
-| Tracing | `app/tracing.py` | OpenTelemetry → Langfuse (OTLP), with bank/tax-ID redaction |
-| Docs | `docs/scoping.md`, `docs/runbook.md` | Customer scoping template and operations runbook |
+**Demo video:** _Add the link to your recorded walkthrough here (YouTube, Loom, or a GitHub Release) before publishing._
 
-Reference results from the frozen test split (425 invoices, offline extractors, Tesseract OCR)
-are in [`docs/reference-results/test-report.md`](docs/reference-results/test-report.md):
-0 wrong auto-approvals, 0 approvals with misread fields, 0 false rejections, all 225 seeded
-errors stopped, 73% of payable invoices automated; a naive "PO exists → approve" baseline
-auto-approves 256 bad invoices on the same data.
+## Why LedgerGuard?
 
----
+Accounts payable teams receive invoices in inconsistent formats, reconcile them against purchase orders and receipts, investigate exceptions, and decide which payments require a human. A language model alone is not a safe decision-maker for financial execution.
 
-## Verify it locally — step by step
+LedgerGuard separates **probabilistic document understanding** from **deterministic business authorization**:
 
-Do these in order. Each level adds one dependency, so when something fails you know what
-caused it. Commands are for macOS / Linux; on Windows use `.venv\Scripts\python` instead of
-`.venv/bin/python`, or use WSL.
+1. Ingest a PDF and store it in a private, tenant-scoped document bucket.
+2. Parse text or apply OCR for scanned invoices.
+3. Extract invoice fields into a structured schema using OpenAI or offline extractors.
+4. Validate totals, currency, duplicates, vendor identity, PO status, quantities, and prices.
+5. Match invoice lines against authorized purchase orders and goods receipts.
+6. Route each document to **reject**, **human review**, or **approval** using customer-specific policies.
+7. Allow an authorized reviewer to correct fields or approve, then **revalidate** before any action.
+8. Persist jobs, workflow state, and an audit history; use an idempotent outbox for accounting-system integrations.
+9. In shadow mode, record the intended execution without posting an external Bill.
 
-### Level 0 — prerequisites
+## AWS Architecture (deployed demo)
 
-| Need | For | Check |
-|---|---|---|
-| Python 3.11 or 3.12 | everything | `python3 --version` |
-| Docker (or a local Postgres 16 with pgvector) | levels 2–4 | `docker --version` |
-| Tesseract (optional) | OCR of scanned invoices | `tesseract --version` (`brew install tesseract` / `apt install tesseract-ocr`) |
-| Node 20+ (optional) | review UI | `node --version` |
+```mermaid
+flowchart TB
+    User["AP analyst / approver"]
+    Browser["React + TypeScript browser app"]
+    Cognito["Amazon Cognito<br/>OAuth2 Authorization Code + PKCE"]
+    CDN["CloudFront + private frontend S3"]
+    Edge["AWS WAF + HTTPS ALB"]
+    API["FastAPI<br/>ECS Fargate API task"]
+    DB[("RDS PostgreSQL / pgvector<br/>tenants, POs, receipts, jobs, audit")]
+    Files[("Private S3 invoice documents")]
+    Worker["LangGraph<br/>ECS Fargate worker task"]
+    OCR["PDF parsing / Tesseract OCR"]
+    LLM["OpenAI structured extraction"]
+    Rules["Deterministic validation<br/>three-way matching + policy"]
+    Route{"Decision gate"}
+    Reject["Reject + audit"]
+    Review["Human review / corrections"]
+    Shadow["Shadow-approved + audit"]
+    AP["Accounting integration adapter<br/>QuickBooks sandbox / mock"]
 
-### Level 1 — the logic, offline (no database, no API key) · ~5 minutes
+    User --> Browser
+    Browser <-->|"Static app"| CDN
+    Browser <-->|"Sign-in"| Cognito
+    Browser -->|"JWT-authenticated API requests"| Edge
+    Edge --> API
+    API <--> DB
+    API <--> Files
+    DB -->|"Postgres job queue / lease"| Worker
+    Worker --> Files
+    Worker --> OCR --> LLM --> Rules --> Route
+    Rules <--> DB
+    Worker -->|"Checkpoint + audit"| DB
+    Route --> Reject
+    Route --> Review
+    Route --> Shadow
+    Review -->|"Authorized decision + revalidation"| API
+    Shadow -.->|"External execution disabled in demo"| AP
+```
+
+**Cloud delivery:** Terraform provisions networking, security groups, private RDS, S3, ECS services, ECR, Cognito, CloudFront, WAF, certificates, monitoring, and GitHub OIDC permissions. GitHub Actions builds a Docker image, pushes an immutable commit-tagged image to ECR, updates ECS tasks, builds the React app, syncs it to S3, and invalidates CloudFront.
+
+```mermaid
+flowchart LR
+    Git["GitHub feature branch"] --> CI["CI: pytest + safety evaluation + UI build"]
+    Git --> CD["Manual GitHub Actions deployment"]
+    CD --> OIDC["Short-lived AWS OIDC role"]
+    OIDC --> ECR["Docker build + ECR push"]
+    ECR --> ECS["ECS API and worker rollout"]
+    OIDC --> UI["Vite production build"]
+    UI --> S3["Private frontend S3"]
+    S3 --> CF["CloudFront cache invalidation"]
+```
+
+## Product walkthrough
+
+### 1. Human-in-the-loop review
+
+Invoices exceeding the customer's auto-approval limit, scanned documents, or other review-flagged cases are held for a human decision. The approver sees the original PDF next to extracted fields and a reason for review.
+
+![Invoice awaiting human review with approval controls](docs/images/13-approve-rejected-workflow.png)
+
+### 2. Authorized approval and immutable audit history
+
+The reviewer decision is recorded; the workflow revalidates authorization and invoice evidence. In the AWS demo, the final event was `shadow_would_execute`, **not** a posted accounting Bill.
+
+![Approved invoice with review and shadow audit events](docs/images/04-audit-trail.png)
+
+### 3. Automated path for a valid invoice
+
+A valid invoice passes validation and matching, reaching `shadow_approved` when shadow mode is enabled.
+
+![Valid invoice in shadow-approved state](docs/images/11-approved-workflow.png)
+
+### 4. Deterministic rejection of invalid totals
+
+An invoice whose totals fail financial checks is rejected with an explicit reason rather than being sent for payment.
+
+![Invoice rejected for total mismatch](docs/images/12-rejected-workflow.png)
+
+## Engineering evidence
+
+| Area | Demonstrated implementation |
+|---|---|
+| **AI engineering** | PDF/OCR preprocessing, schema-constrained extraction, field checks, confidence/risk routing, evaluation harness, adversarial cases |
+| **Forward deployed engineering** | Per-customer policy YAML, tenant-scoped access, business-rule customization, review UX, accounting integration boundary, incident troubleshooting |
+| **DevOps / platform** | AWS Fargate, RDS, private S3, Cognito, WAF/ALB, CloudFront, Terraform, GitHub Actions OIDC, ECR, CloudWatch |
+| **Reliability** | Postgres job queue with `SKIP LOCKED`, leases/retries, durable LangGraph checkpoints, outbox/idempotency and read-back checks in local/mock integration tests |
+| **Security** | JWT authentication, role/approval limits, row-level security, least-privilege task roles, shadow execution, audit events, untrusted-document handling |
+
+### AWS services
+
+The demo ran separate **API** and **worker** ECS tasks, both observed running during verification.
+
+![LedgerGuard API and worker services running on ECS](docs/images/05-aws-ecs.png)
+
+### Automated AWS delivery
+
+GitHub Actions deployment **#4** completed successfully, including container deployment and frontend delivery.
+
+![Successful LedgerGuard AWS deployment workflow](docs/images/06-github-cicd.png)
+
+### Real OpenAI API traffic
+
+CloudWatch logs captured successful HTTP 200 requests from the deployed worker to the OpenAI API. This confirms API connectivity during the demo; **it is not a measured model-accuracy result**.
+
+![CloudWatch logs of successful OpenAI API requests](docs/images/18-Cloudwatch.png)
+
+## Evaluation and testing
+
+LedgerGuard includes a seeded synthetic-invoice generator and a reproducible offline safety evaluation. These metrics are **rules-based / OCR evaluations**, not the performance of a separately benchmarked live LLM system.
+
+| Metric | Corrected 86-case CI split | Documented 425-case frozen test split |
+|---|---:|---:|
+| Pipeline processing errors | 0 | 0 |
+| Wrong automatic approvals | **0** | **0** |
+| Automatic approvals with misread fields | **0** | **0** |
+| False rejections | **0** | **0** |
+| Seeded bad/problematic cases stopped from auto-approval | **36 / 36** | **225 / 225** |
+| Scanned invoices routed to review | **10 / 10** | **50 / 50** |
+
+On the documented frozen split, **72.92% of approvable invoices** were automatically approved using offline extractors; the naive *“PO exists → approve”* baseline produced **256 wrong automatic approvals**. These are synthetic-dataset results, not claims about real customer invoices.
+
+See [`docs/reference-results/test-report.md`](docs/reference-results/test-report.md) for the frozen evaluation report. Local validation also recorded **70 passing Python tests** before subsequent readiness/safety regression additions, with successful React production builds. The full suite should be rerun on any later code changes.
+
+## Key safety and design decisions
+
+- **Rules before LLM confidence:** hard business failures take precedence over model output.
+- **Fail closed for scans:** customer policy disables scanned-invoice auto-approval; a human reviews uncertain OCR output.
+- **Human approval is not a bypass:** authorization, document version, business checks, and limits are revalidated.
+- **Tenant separation:** PostgreSQL row-level security restricts access to tenant records.
+- **Durability:** the worker leases jobs from PostgreSQL, retries failures, and checkpoints workflow state.
+- **Idempotency:** outbox and read-back logic are exercised against the local/mock accounting adapter; production ERP behavior requires separate verification.
+- **No external posting in the cloud demo:** `SHADOW_MODE=true` records `shadow_would_execute` without sending a QuickBooks Bill.
+
+## Technology stack
+
+| Layer | Stack |
+|---|---|
+| UI | React, TypeScript, Vite |
+| Backend | Python, FastAPI, Pydantic |
+| Document AI | PyMuPDF, Tesseract OCR, optional Docling, OpenAI structured extraction |
+| Orchestration | LangGraph, PostgreSQL worker/job queue |
+| Data | PostgreSQL 16, pgvector, private S3 |
+| Identity | Amazon Cognito OAuth2/PKCE, JWT, tenant roles |
+| Infrastructure | AWS ECS Fargate, RDS, ECR, S3, CloudFront, ALB, WAF, Route 53, ACM |
+| Delivery / operations | Terraform, GitHub Actions OIDC, Docker, CloudWatch, OpenTelemetry |
+| Test & evaluation | pytest, synthetic invoice generator, frozen split, offline safety gate |
+
+## Run locally
+
+> AWS resources have been decommissioned. **Local Docker development does not require deploying the AWS stack.** Start with the included mock AP provider and shadow mode. Never commit real credentials.
+
+**Prerequisites:** Python (compatible version per `pyproject.toml`), Docker Desktop/Compose, Node.js (version compatible with `ui/package.json`), and Tesseract for scanned-document OCR.
 
 ```bash
-unzip ap-agent.zip && cd ap-agent
-python3 -m venv .venv
-.venv/bin/python -m pip install -U pip
-.venv/bin/python -m pip install -e ".[dev,ocr]"
+# Clone the working implementation
+ git clone https://github.com/Jithendra-Kantharaju/ledgerguard.git
+ cd ledgerguard
+ git switch ledgerguard-production-hardening
 
-# 1. Unit tests: parsing, extraction, rules, match, router gate order, redaction, mock AP idempotency
-.venv/bin/python -m pytest tests/unit -q          # expect: 45 passed
+# Create your private environment file and review its required variables
+ cp .env.example .env
 
-# 2. Generate data with known answers (dev split + frozen test split)
-make data        # or run the three commands under "data:" in the Makefile
+# Use safe local settings in .env:
+# AUTH_MODE=api_key
+# AP_PROVIDER=mock
+# SHADOW_MODE=true
+# STORAGE_BACKEND=local
+# EXTRACTOR=rules
+# SECONDARY_EXTRACTOR=rules_alt
 
-# 3. Evaluate on the dev split, with the naive baseline for comparison
-.venv/bin/python -m eval.run_eval --split data/generated/dev --baselines
+# Validate Compose configuration, then start the local services
+ docker compose config --quiet
+ docker compose up -d --build
+ docker compose ps
+
+# Verify local API readiness (after database initialization)
+ curl http://localhost:8000/healthz
+ curl http://localhost:8000/readyz
 ```
 
-What to look for in the report: **wrong auto-approvals = 0** and **approved with misread
-fields = 0** for the pipeline, every row of "Seeded errors stopped" at n/n, and the naive
-baseline approving many bad invoices. Without Tesseract, scanned invoices are unreadable and
-all go to review (that is the correct, safe behaviour). Add `OCR_BACKEND=tesseract` in front
-of the command to include OCR.
+**Local review UI:** `http://localhost:5173` when the UI service is configured and running. See [`docs/runbook.md`](docs/runbook.md) and `.env.example` for initialization and demo data.
+
+### Reproduce the safety CI evaluation
 
 ```bash
-# 4. Fit confidence calibration on dev, then the final eval on the frozen test set
-OCR_BACKEND=tesseract .venv/bin/python -m eval.calibrate --split data/generated/dev
-OCR_BACKEND=tesseract .venv/bin/python -m eval.run_eval --split data/generated/test \
-    --baselines --require-frozen --max-wrong-approvals 0
+python -m pip install -e ".[dev,ocr]"
+python -m data.generate --out data/generated --split ci \
+  --seed 11 --n-clean 40 --n-scanned 10 --n-per-error 4
+
+# Requires Tesseract installed and on PATH
+OCR_BACKEND=tesseract python -m eval.run_eval \
+  --split data/generated/ci \
+  --baselines --max-wrong-approvals 0
 ```
 
-`eval/results/threshold_sweep.png` shows the automation-vs-error trade-off that set the
-threshold. `--require-frozen` refuses to run if any test file changed since `make data`.
+Expected dataset size: **86 cases**; the safety gate is designed to exit nonzero if an unsafe automatic approval is detected. OCR-dependent results can vary across environments, so inspect the actual report.
 
-### Level 2 — the database guarantees (Postgres) · ~5 minutes
+### Repository map
 
-```bash
-# Postgres 16 + pgvector in Docker
-docker run -d --name apdb -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=apagent \
-    -p 5432:5432 pgvector/pgvector:pg16
-
-# Integration tests: create their own database (apagent_test), then test
-TEST_ADMIN_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/postgres \
-    .venv/bin/python -m pytest tests/integration -q          # expect: 22 passed
+```text
+app/api/                FastAPI routes, authentication and tenant checks
+app/pipeline/           Parsing, extraction, validation, retrieval, matching, routing
+app/worker/             LangGraph workflow, asynchronous worker and queue
+app/actions/            Accounting dispatch/outbox logic
+app/db/                 PostgreSQL schema, RLS and database access
+app/config/             Customer-specific business policies
+ui/                     React invoice review dashboard
+data/                   Synthetic invoice generator
+eval/                   Safety evaluations and reference results
+tests/                  Unit and integration coverage
+infra/terraform/        Reproducible AWS infrastructure
+.github/workflows/      CI and AWS deployment automation
+docs/                   Runbooks, evaluation reports and demo screenshots
 ```
 
-These prove the properties that matter in production:
+## Deployment status and limitations
 
-- one tenant cannot read or write another tenant's rows, even with no `WHERE` clause (RLS)
-- the app role cannot update or delete the audit log
-- a reviewer cannot approve; a stale version is refused; an approval above the approver's limit is refused
-- if the PO is closed after review started, approval does not execute (revalidation)
-- a correction reruns every check and goes back to review, never straight to payment
-- a lost response after the AP system saved the bill is recovered by a status query, with no duplicate
-- an outage retries with backoff, then dead-letters and flags the document
-- a wrong read-back is not marked executed
-- two workers never get the same job; a crashed worker's job is requeued
-- a review pause survives a worker restart (a new worker resumes from the Postgres checkpoint)
-- shadow mode decides but sends nothing
+- The hosted AWS demonstration environment was **destroyed after recording**; `app.project-jithendra.click` and `api.project-jithendra.click` are not maintained as live endpoints.
+- The showcased cloud run used **shadow execution**. QuickBooks sandbox connectivity was tested, but live Bill posting, OAuth refresh under long-running workloads, and accounting reconciliation were **not** established as production-ready.
+- The AWS screenshots show real OpenAI API requests, but live model-extraction accuracy, calibrated confidence, and ongoing cost-per-invoice performance have not been fully established in this README.
+- Before a real customer deployment: resolve dependency alerts, validate tenant isolation and security controls in the target environment, exercise backup/restore and failure recovery, and benchmark the complete live extraction + ERP workflow.
 
-### Level 3 — run the system and click through it · ~10 minutes
+## Author
 
-Four terminals, all in the project folder, Postgres from level 2 still running.
-
-```bash
-cp .env.example .env               # defaults point at localhost:5432
-
-# terminal 1: schema + demo tenants, users, API keys, ERP data
-.venv/bin/python -m scripts.init_db
-.venv/bin/python -m scripts.seed   # prints the dev API keys, e.g. dev-acme-approver
-.venv/bin/python -m uvicorn app.mock_ap.server:app --port 8001
-
-# terminal 2
-.venv/bin/python -m uvicorn app.api.main:app --port 8000
-
-# terminal 3
-.venv/bin/python -m app.worker.main
-
-# terminal 4: upload the 19 demo invoices, then look at the results
-.venv/bin/python -m scripts.upload_demo
-curl -s -H "X-API-Key: dev-acme-approver" localhost:8000/stats
-# expect roughly: {"awaiting_review": 6, "executed": 5, "rejected": 8}
-curl -s -H "X-API-Key: dev-acme-approver" "localhost:8000/documents?status=awaiting_review"
-```
-
-Approve one of the "above auto-approve limit" invoices (copy its `id` and `version`):
-
-```bash
-DOC=<id>
-# A reviewer cannot approve (403):
-curl -s -X POST localhost:8000/documents/$DOC/review -H "X-API-Key: dev-acme-reviewer" \
-     -H "Content-Type: application/json" -d '{"action":"approve","expected_version":1}'
-# An approver can (202), and the worker revalidates before anything is sent:
-curl -s -X POST localhost:8000/documents/$DOC/review -H "X-API-Key: dev-acme-approver" \
-     -H "Content-Type: application/json" -d '{"action":"approve","expected_version":1}'
-curl -s -H "X-API-Key: dev-acme-approver" localhost:8000/documents/$DOC
-# status "executed", an outbox row "confirmed" with an AP bill id, and the audit trail:
-# uploaded → analyzed → review_submitted → approved_by_reviewer → execution_queued → executed
-curl -s localhost:8001/_state      # the bills the mock AP system holds
-# Tenant isolation over HTTP: Borealis cannot see Acme's document (404)
-curl -s -H "X-API-Key: dev-borealis-approver" localhost:8000/documents/$DOC
-```
-
-Try failure handling by hand: `curl -X POST localhost:8001/_faults -H "Content-Type: application/json" -d '{"lose_response_after_commit":1}'`,
-then approve another document and look for `execution_recovered_by_status_query` in its audit trail.
-
-Review UI (optional): `cd ui && npm install && npm run dev`, open http://localhost:5173 and
-paste `dev-acme-approver` as the key. API docs: http://localhost:8000/docs.
-
-### Level 4 — with a real model (API key) · minutes, a few cents
-
-Only after levels 1–3 pass. Start small so cost stays visible.
-
-```bash
-export ANTHROPIC_API_KEY=sk-ant-...
-# 20 dev invoices, Claude as the primary extractor, the rule extractor as the second pass
-.venv/bin/python -m eval.run_eval --split data/generated/dev --extractor anthropic \
-    --secondary rules_alt --limit 20 --out eval/results/dev-claude
-```
-
-Check that field accuracy is close to 100% on digital invoices, injection cases still go to
-review, and look at the token counts in the report. Then compare models
-(`--extractor anthropic:claude-sonnet-5-5`), and optionally the LLM-as-judge baseline
-(`--llm-judge --limit 20`), which shows what happens when the model makes the decision.
-
-To use the model in the running system, set in `.env` and restart the worker:
-
-```
-EXTRACTOR=anthropic
-SECONDARY_EXTRACTOR=anthropic:claude-sonnet-5-5   # two independent model passes for agreement
-ANTHROPIC_API_KEY=sk-ant-...
-```
-
-Re-run `eval.calibrate` after changing extractors: the confidence model is specific to them.
-
-### Level 5 — the whole stack in Docker, then deploy
-
-```bash
-docker compose up --build
-# API :8000, UI :5173, mock AP :8001, MinIO console :9001 (minioadmin / minioadmin)
-.venv/bin/python -m scripts.upload_demo     # from the host, against the containers
-```
-
-Before deploying anywhere real:
-
-1. `python -m scripts.seed --random-keys` (or create users yourself) — the `dev-*` keys are public.
-2. Set a real `APP_DB_PASSWORD` when running `init_db`, and put secrets in a secret manager, not `.env`.
-3. Replace the mock AP system with an adapter for the customer's AP API (`app/actions/ap_client.py`
-   is the seam: `create_bill`, `find_by_key`, `get_bill`). Keep `SHADOW_MODE=true` for the first weeks.
-4. Calibrate on the customer's own labelled invoices, then rerun the frozen-test eval.
-5. Point `OTEL_EXPORTER_OTLP_ENDPOINT` at Langfuse (or any OTLP backend) and read `docs/runbook.md`.
-
----
-
-## Honest limitations
-
-- **Docker files were not run** in the environment this was built in (no Docker daemon there).
-  Everything else was run: 67 tests against Postgres 16 + pgvector, the API, worker and mock AP
-  as real processes, the UI build, and the evals above. If `docker compose` misbehaves, levels 1–3
-  do not depend on it.
-- **The data is synthetic.** Three invoice layouts, generated scans. Real invoices are messier;
-  the rule extractors are there so everything runs offline, and they will not read arbitrary
-  real invoices. Use an LLM extractor for real documents and measure it on real, labelled ones.
-- **The calibration set is small** (144 dev invoices, few misreads). The threshold it picks is
-  fragile; with the customer's threshold at 0.80 every scanned invoice currently goes to review.
-- **Two passes over the same OCR text are not independent.** When OCR misreads a digit, both
-  extractors agree on the wrong value. For scans, a second, different reading (another OCR
-  engine or a vision model) is the real fix.
-- **No real AP connector.** The mock behaves like real AP APIs in the ways that matter (idempotency
-  keys, lost responses, read-back), but QuickBooks / NetSuite / SAP adapters are not included.
-- **No SSO.** API keys per user; swap `current_user` in `app/api/main.py` for OIDC in a real deployment.
+Built as a hands-on AI systems and cloud engineering project by [Jithendra Kantharaju](https://github.com/Jithendra-Kantharaju).
