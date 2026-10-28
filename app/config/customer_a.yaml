@@ -10,6 +10,6 @@ confidence_threshold: 0.80
 vendor_match_min: 0.85
 max_invoice_age_days: 365
 # OCR'd invoices may auto-approve if every check passes and calibrated confidence clears the threshold.
-allow_auto_approve_scanned: true
+allow_auto_approve_scanned: false
 ap:
   approved_status: approved
