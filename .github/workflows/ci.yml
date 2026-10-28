@@ -1,44 +1,93 @@
+
 name: ci
 
-on: [push, pull_request]
+# Manual execution only.
+# No automatic runs on push or pull_request.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   test:
+    name: Python tests and safety evaluation
     runs-on: ubuntu-latest
+
     services:
       postgres:
         image: pgvector/pgvector:pg16
         env:
           POSTGRES_PASSWORD: postgres
-        ports: ["5432:5432"]
+        ports:
+          - "5432:5432"
         options: >-
-          --health-cmd "pg_isready -U postgres" --health-interval 2s --health-retries 30
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-retries 30
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: sudo apt-get update && sudo apt-get install -y tesseract-ocr
-      - run: pip install -e ".[dev,ocr]"
-      - run: ruff check app eval data scripts tests
-      - name: unit tests
+
+      - name: Install Tesseract OCR
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr
+
+      - name: Install Python dependencies
+        run: pip install -e ".[dev,ocr]"
+
+      - name: Ruff linting
+        run: ruff check app eval data scripts tests
+
+      - name: Unit tests
         run: pytest tests/unit -q
-      - name: integration tests
+
+      - name: Integration tests
         env:
           TEST_ADMIN_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
         run: pytest tests/integration -q
-      - name: eval gate (no unsafe auto-approvals on a fresh split)
+
+      - name: Safety evaluation
         env:
           OCR_BACKEND: tesseract
         run: |
-          python -m data.generate --out data/generated --split ci --seed 11 --n-clean 40 --n-scanned 10 --n-per-error 4
-          python -m eval.run_eval --split data/generated/ci --baselines --max-wrong-approvals 0
+          python -m data.generate \
+            --out data/generated \
+            --split ci \
+            --seed 11 \
+            --n-clean 40 \
+            --n-scanned 10 \
+            --n-per-error 4
+
+          python -m eval.run_eval \
+            --split data/generated/ci \
+            --baselines \
+            --max-wrong-approvals 0
 
   ui:
+    name: React frontend build
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - run: cd ui && npm install --no-audit --no-fund && npm run build
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Build frontend
+        working-directory: ui
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
